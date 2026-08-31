@@ -28,10 +28,10 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Ruff lint (github annotations)
-        run: ruff check honestcode tests scripts --output-format=github
+        run: ruff check honestcode tests scripts benchmarks --output-format=github
 
       - name: Ruff format check
-        run: ruff format --check honestcode tests scripts
+        run: ruff format --check honestcode tests scripts benchmarks
 
       - name: Pre-commit hooks
         run: |
@@ -65,6 +65,38 @@ jobs:
         with:
           files: coverage.xml
           fail_ci_if_error: false
+
+  benchmark-accuracy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Agent-accuracy benchmark
+        run: python benchmarks/agent_accuracy/run.py --format text
+
+  benchmark-performance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Performance benchmark
+        run: python scripts/benchmark.py --repeat 3 --format text
 
   build:
     runs-on: ubuntu-latest
