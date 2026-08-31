@@ -84,6 +84,7 @@ def test_registry_contains_all_tools():
         "load_package_apis",
         "get_project_stats",
         "choose_tool",
+        "verify_file",
     }
     assert set(server_mod._ALL_TOOLS.keys()) == expected
 

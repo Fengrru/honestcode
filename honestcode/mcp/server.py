@@ -105,6 +105,17 @@ def _mcp_scan_file(file_path: str) -> dict:
     return _tools.scan_file(file_path)
 
 
+def _mcp_verify_file(file_path: str) -> dict:
+    """Verify a file and return structured evidence for the agent.
+
+    Returns ``status``, ``findings`` with ``evidence``, and a ``text`` summary.
+
+    Args:
+        file_path: Absolute path to the Python file.
+    """
+    return _tools.verify_file(file_path)
+
+
 def _mcp_load_package_apis(package_name: str) -> dict:
     """Load (and cache) API signatures for a specific installed package.
 
@@ -207,6 +218,7 @@ def _mcp_choose_tool(query: str) -> dict:
 # env var) to its wrapper function and short description.
 _ALL_TOOLS: dict[str, tuple[Callable, str]] = {
     "scan_file": (_mcp_scan_file, "Scan a file for undefined calls and API issues."),
+    "verify_file": (_mcp_verify_file, "Verify a file and return structured agent evidence."),
     "index": (_mcp_index_project, "Build the project symbol index."),
     "deps": (_mcp_load_project_deps, "Load dependency APIs."),
     "check_symbol": (_mcp_check_symbol, "Verify a symbol is defined in the project."),

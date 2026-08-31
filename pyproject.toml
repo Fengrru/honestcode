@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "honestcode"
-version = "0.2.0"
-description = "A lightweight MCP server that detects AI code hallucinations in real time — undefined symbols, wrong API calls, dead code, and type mismatches."
+version = "0.3.0"
+description = "The deterministic verification layer for AI coding agents. Catch invented APIs, undefined symbols, and wrong calls before your agent moves on."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -15,14 +15,16 @@ authors = [
 keywords = [
     "mcp",
     "model-context-protocol",
+    "verification",
+    "ai-coding-agent",
     "hallucination-detection",
+    "invented-api",
     "code-generation",
     "static-analysis",
     "llm",
     "ai",
     "code-analysis",
-    "dead-code",
-    "type-checking",
+    "agent-tooling",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

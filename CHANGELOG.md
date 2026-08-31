@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-31
+
+### Changed
+
+- **Repositioned as a verification layer for AI coding agents** — README,
+  pyproject description, and keywords now lead with product value rather than
+  "MCP server".
+
+### Added
+
+- **Agent-facing evidence protocol** (`honestcode.verify.evidence`) with
+  ``status``, ``kind``, ``owner``, ``evidence``, ``confidence``, and
+  ``action`` fields.
+- **`invented_api` detection** — resolves a call's receiver to a concrete
+  class via annotations, constructors, imports, and `self`, then checks the
+  member surface against the repository AST.
+- **`verify_file` tool and CLI** — returns structured evidence plus a
+  human-readable ``text`` summary, designed for agents to consume directly.
+- **Auto-indexing in `scan_file`** — when no project index is loaded, HonestCode
+  walks up from the target file and indexes the first project marker it finds
+  (`.honestcode/`, `.git/`, `pyproject.toml`, `setup.py`, `requirements.txt`).
+- **`scan --format text` / `honestcode verify`** — terminal-readable output for
+  demos and CI.
+- **Real-world demo** at `demos/invented-api/` reproducing the
+  `UserClient.refresh_token()` hallucination and its fix, including a
+  self-contained `render_gif.py` that generates the README GIF without
+  requiring vhs/ttyd/ffmpeg.
+- **Agent-accuracy benchmark** at `benchmarks/agent_accuracy/` with a
+  deterministic, LLM-free dataset measuring hallucination detection.
+- Import validation: `from myproject import does_not_exist` is now caught as
+  an undefined symbol; relative intra-package imports remain supported.
+
+### Changed
+
+- `scan_file` now returns the new evidence shape (`status`, `findings`,
+  `summary`) while keeping the legacy `issues` list for backwards compatibility.
+
 ## [0.2.0] - 2026-08-03
 
 ### Changed

@@ -112,7 +112,23 @@ def _cmd_deps(args: argparse.Namespace) -> int:
 
 
 def _cmd_scan(args: argparse.Namespace) -> int:
-    return _emit_issues(_tools.scan_file(args.file), issue_key="issues")
+    report = _tools.scan_file(args.file)
+    if not report.get("success", True):
+        return _emit(report)
+    if getattr(args, "format", "json") == "text":
+        from honestcode.verify.evidence import render_text
+
+        sys.stdout.write(render_text(report) + "\n")
+        return 1 if report["status"] == "fail" else 0
+    return _emit_issues(report, issue_key="issues")
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    report = _tools.verify_file(args.file)
+    if not report.get("success", True):
+        return _emit(report)
+    sys.stdout.write(report["text"] + "\n")
+    return 1 if report["status"] == "fail" else 0
 
 
 def _cmd_check_symbol(args: argparse.Namespace) -> int:
@@ -201,7 +217,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("scan", help="Scan a file for undefined calls and API issues.")
     p.add_argument("file", help="Path to the Python file to scan.")
+    p.add_argument(
+        "--format",
+        choices=["json", "text"],
+        default="json",
+        help="Output format (default: json).",
+    )
     p.set_defaults(func=_cmd_scan)
+
+    p = sub.add_parser("verify", help="Verify a file and print agent-readable evidence.")
+    p.add_argument("file", help="Path to the Python file to verify.")
+    p.set_defaults(func=_cmd_verify)
 
     p = sub.add_parser("check-symbol", help="Check whether a symbol is defined in the project.")
     p.add_argument("symbol", help="Module-qualified symbol name, e.g. pkg.core.helper.")
