@@ -1,0 +1,7 @@
+{
+  "name": "invented_method",
+  "description": "Agent invents a UserClient.refresh_token() method that does not exist.",
+  "target_file": "app/login.py",
+  "expected_issue_kind": "invented_api",
+  "expected_symbol": "UserClient.refresh_token"
+}

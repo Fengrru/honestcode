@@ -1,0 +1,7 @@
+{
+  "name": "invented_module_attr",
+  "description": "Agent calls a method (query) on a class that only has execute().",
+  "target_file": "app/db.py",
+  "expected_issue_kind": "invented_api",
+  "expected_symbol": "Connection.query"
+}

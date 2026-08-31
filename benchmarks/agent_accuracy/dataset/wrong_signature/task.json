@@ -1,0 +1,7 @@
+{
+  "name": "wrong_signature",
+  "description": "Agent calls an existing function with the wrong number of arguments.",
+  "target_file": "app/calc.py",
+  "expected_issue_kind": "wrong_call",
+  "expected_symbol": "add()"
+}

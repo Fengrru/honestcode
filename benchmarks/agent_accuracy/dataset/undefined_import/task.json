@@ -1,0 +1,7 @@
+{
+  "name": "undefined_import",
+  "description": "Agent imports a symbol (delete_user) that the module does not export.",
+  "target_file": "app/users.py",
+  "expected_issue_kind": "undefined_symbol",
+  "expected_symbol": "delete_user"
+}
