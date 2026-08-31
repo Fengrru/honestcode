@@ -37,7 +37,9 @@ from honestcode.mcp.knowledge_base import APIKnowledgeBase
 from honestcode.sandbox import SandboxExecutor
 from honestcode.structure.extractor import StructureExtractor
 from honestcode.structure.relations import ParseResult
-from honestcode.structure.utils import call_base, call_name
+from honestcode.structure.utils import call_name
+from honestcode.verify.evidence import build_report, render_text
+from honestcode.verify.verify import valid_imported_names, verify_tree
 
 __all__ = [
     "index_project",
@@ -54,9 +56,50 @@ __all__ = [
     "explore_call_graph",
     "search_code",
     "choose_tool",
+    "verify_file",
 ]
 
 logger = logging.getLogger(__name__)
+
+_AUTO_INDEX_ENABLED = os.environ.get("HONESTCODE_AUTO_INDEX", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_PROJECT_MARKERS = (".honestcode", ".git", "pyproject.toml", "setup.py", "requirements.txt")
+
+
+def _find_project_root(start: Path) -> Path | None:
+    """Walk upward from *start* looking for a project marker."""
+    cur = start.resolve()
+    for candidate in [cur, *cur.parents]:
+        if (candidate / ".honestcode" / "config.json").exists():
+            return candidate
+        if (candidate / ".git").exists():
+            return candidate
+    for candidate in [cur, *cur.parents]:
+        if any((candidate / m).exists() for m in _PROJECT_MARKERS):
+            return candidate
+    return None
+
+
+def _ensure_index_for(path: Path) -> bool:
+    """Auto-index the project containing *path* when no index is loaded."""
+    global _project_index, _project_root
+    with _state_lock:
+        if _project_index is not None or not _AUTO_INDEX_ENABLED:
+            return False
+    root = _find_project_root(path)
+    if root is None:
+        return False
+    idx = get_project_index(root, force_rebuild=False)
+    with _state_lock:
+        _project_index = idx
+        _project_root = root
+        _invalidate_graph_cache()
+    return True
+
 
 # ── Global server state ────────────────────────────────────────────────
 _state_lock = threading.RLock()
@@ -93,6 +136,47 @@ def _module_name(p: Path, root: Path) -> str:
     if parts and parts[-1] == "__init__":
         parts.pop()
     return ".".join(parts)
+
+
+def _resolve_relative_module(current_module: str, level: int, target: str) -> str:
+    """Resolve a relative import target to an absolute module name."""
+    if level == 0:
+        return target
+    parts = current_module.split(".")
+    if level > len(parts):
+        return ""
+    prefix = parts[:-level]
+    if target:
+        prefix.append(target)
+    return ".".join(prefix)
+
+
+def _normalize_imported_symbols(
+    imported_symbols: dict[str, str],
+    tree: ast.AST,
+    module: str,
+) -> dict[str, str]:
+    """Convert relative import sources to absolute module names.
+
+    ``StructureExtractor`` stores relative imports without their leading dots.
+    Normalizing them here lets ``valid_imported_names`` validate them against
+    the project index without producing false positives on intra-package
+    imports.
+    """
+    normalized = dict(imported_symbols)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level == 0:
+            continue
+        target = node.module or ""
+        abs_module = _resolve_relative_module(module, node.level, target)
+        if not abs_module:
+            continue
+        for alias in node.names:
+            local = alias.asname or alias.name
+            normalized[local] = f"{abs_module}.{alias.name}"
+    return normalized
 
 
 def _with_module_prefix(p: Path, root: Path, res: ParseResult) -> ParseResult:
@@ -531,22 +615,6 @@ def _collect_assign_targets(target: ast.expr, defined: set[str]) -> None:
         _collect_assign_targets(target.value, defined)
 
 
-def _imported_names(res) -> set[str]:
-    """Flatten imported symbols into locally bound names.
-
-    Handles ``import X`` (binds X), ``import X as Y`` (binds Y),
-    ``from M import A`` (binds A), and ``from M import A as B`` (binds B).
-    """
-    bound: set[str] = set()
-    for local_name, source_name in (res.imported_symbols or {}).items():
-        bound.add(local_name)
-        # Also expose the leaf of the source so `pd.read_csv` matches
-        # `import pandas as pd` (local_name == "pd").
-        if source_name:
-            bound.add(source_name.split(".")[0])
-    return bound
-
-
 def _builtin_names() -> set[str]:
     """Return the full set of Python builtin names (functions + exceptions)."""
     import builtins
@@ -613,7 +681,7 @@ def _scan_non_python(p: Path) -> dict:
 
 
 def scan_file(file_path: str) -> dict:
-    """Scan a file for potential hallucinations: undefined symbols and missing imports."""
+    """Scan a file for potential hallucinations: undefined symbols and invented APIs."""
     p = Path(file_path)
     if not p.exists():
         return {"success": False, "error": f"File not found: {file_path}"}
@@ -623,6 +691,10 @@ def scan_file(file_path: str) -> dict:
         res = _extractor.parse_file(p)
     except Exception as e:  # noqa: BLE001
         return {"success": False, "error": str(e)}
+
+    # Try to ground the file automatically: most agents call scan_file on a
+    # freshly-written path without remembering to call index_project first.
+    _ensure_index_for(p)
 
     with _state_lock:
         idx = _project_index
@@ -636,35 +708,51 @@ def scan_file(file_path: str) -> dict:
 
     # Locally defined names (functions/classes/vars + parameters + loop targets).
     defined = _collect_local_defined(tree)
-    # Names introduced by import statements (both local alias and module root).
-    defined |= _imported_names(res)
     # Module-qualified project symbols.
     if idx is not None:
         defined |= set(idx.symbols.keys())
+    # Names introduced by import statements, validated against the index and
+    # the loaded dependency API knowledge base.
+    module = _module_name(p, Path(idx.root)) if idx is not None else p.stem
+    imported_symbols = _normalize_imported_symbols(res.imported_symbols or {}, tree, module)
+    defined |= valid_imported_names(imported_symbols, idx, dep_names)
     # Dependency API names.
     defined |= dep_names
     # Full builtin set instead of a hand-picked subset.
     defined |= _builtin_names()
 
-    issues: list[dict] = []
-    seen: set[tuple[str, int]] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = call_name(node.func)
-        if not name:
-            # Complex call target (e.g. ``(a + b).foo()``) — skip, can't judge.
-            continue
-        base = call_base(name)
-        if base in defined or name in defined:
-            continue
-        key = (name, node.lineno)
-        if key in seen:
-            continue
-        seen.add(key)
-        issues.append({"type": "undefined_call", "name": name, "line": node.lineno})
+    findings, checked = verify_tree(
+        tree,
+        path=p,
+        root=Path(idx.root) if idx is not None else None,
+        index=idx,
+        defined=defined,
+        dep_names=dep_names,
+        imported_symbols=imported_symbols,
+    )
+    report = build_report(file=str(p), findings=findings, checked=checked)
+    report["defined_symbols"] = len(defined)
+    return report
 
-    return {"success": True, "file": str(p), "issues": issues, "defined_symbols": len(defined)}
+
+def verify_file(file_path: str) -> dict:
+    """Verify a file and return structured, agent-readable evidence.
+
+    Unlike ``scan_file`` (which also returns legacy ``issues``), this tool
+    exposes only the agent-facing protocol: ``status``, ``findings`` with
+    ``evidence``, and a human-readable ``text`` summary.
+    """
+    report = scan_file(file_path)
+    if not report.get("success", True):
+        return report
+    return {
+        "success": True,
+        "status": report["status"],
+        "file": report["file"],
+        "findings": report["findings"],
+        "summary": report["summary"],
+        "text": render_text(report),
+    }
 
 
 def load_package_apis(package_name: str) -> dict:

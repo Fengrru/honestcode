@@ -123,10 +123,7 @@ def test_wrong_arity_on_known_method(project: Path):
 
 def test_unresolved_base_stays_quiet(project: Path):
     """If a class inherits from an unknown base, do not invent false positives."""
-    code = (
-        "class Proxy(UnknownBase):\n"
-        "    def go(self):\n        self.magic()\n"
-    )
+    code = "class Proxy(UnknownBase):\n    def go(self):\n        self.magic()\n"
     assert _finding(project, code) is None
 
 

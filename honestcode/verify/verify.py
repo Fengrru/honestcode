@@ -432,7 +432,11 @@ class _Verifier:
         if not receiver:
             self._check_bare_call(call, name)
             return
-        if receiver.startswith("self.") or receiver.startswith("cls.") or receiver in ("self", "cls"):
+        if (
+            receiver.startswith("self.")
+            or receiver.startswith("cls.")
+            or receiver in ("self", "cls")
+        ):
             if scope.class_qname is None:
                 return
             qname = self._resolve_self_chain(receiver, scope.class_qname)
@@ -493,7 +497,9 @@ class _Verifier:
 
         members = [k.rsplit(".", 1)[-1] for k in self.dep_names if k.startswith(f"{module}.")]
         near = get_close_matches(attr, members, n=1, cutoff=_NEAR_MISS_CUTOFF)
-        evidence: dict[str, Any] = {"available_methods": sorted(set(members))[:MAX_EVIDENCE_METHODS]}
+        evidence: dict[str, Any] = {
+            "available_methods": sorted(set(members))[:MAX_EVIDENCE_METHODS]
+        }
         if near:
             evidence["did_you_mean"] = near[0]
         self._finding(

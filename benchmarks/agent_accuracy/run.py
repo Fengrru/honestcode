@@ -217,7 +217,9 @@ def render_markdown(results: list[dict[str, Any]], metrics: dict[str, Any]) -> s
     lines.append("")
     lines.append("**Summary**")
     lines.append(f"- tasks: {metrics['tasks']}")
-    lines.append(f"- precision: {metrics['precision']}, recall: {metrics['recall']}, F1: {metrics['f1']}")
+    lines.append(
+        f"- precision: {metrics['precision']}, recall: {metrics['recall']}, F1: {metrics['f1']}"
+    )
     lines.append(f"- false positive rate: {metrics['false_positive_rate']}")
     lines.append(f"- median verify time: {metrics['median_verify_ms']}ms")
     return "\n".join(lines)
