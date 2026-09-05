@@ -44,7 +44,7 @@ classifiers = [
 
 dependencies = [
     # mcp 2.x removed `mcp.server.fastmcp`; pin <2.0 until we adapt to the new API.
-    "mcp>=1.6.0,<2.0",
+    "mcp>=2.1.1,<3.0",
     "pyyaml>=6.0",
     "tomli>=2.0.0; python_version<'3.11'",
 ]
