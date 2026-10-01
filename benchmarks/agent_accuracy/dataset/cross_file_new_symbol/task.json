@@ -1,0 +1,7 @@
+{
+  "name": "cross_file_new_symbol",
+  "description": "Agent writes a new module and then a file importing it in the same session; verification must ground against the fresh index (stale-index false positives would flag NewThing as undefined and miss or mislabel the invented method).",
+  "target_file": "app/main.py",
+  "expected_issue_kind": "invented_api",
+  "expected_symbol": "fly"
+}

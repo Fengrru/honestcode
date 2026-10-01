@@ -186,11 +186,23 @@ def _cmd_choose_tool(args: argparse.Namespace) -> int:
     return _emit(_tools.choose_tool(args.query))
 
 
+def _version_string() -> str:
+    try:
+        from importlib.metadata import version
+
+        return f"honestcode {version('honestcode')}"
+    except Exception:  # noqa: BLE001 - package metadata unavailable (e.g. source tree)
+        from honestcode import __version__
+
+        return f"honestcode {__version__}"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="honestcode",
         description="HonestCode CLI — verify AI-generated code against your project.",
     )
+    parser.add_argument("--version", action="version", version=_version_string())
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     p = sub.add_parser("index", help="Build (or reuse) the project symbol index.")

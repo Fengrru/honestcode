@@ -11,9 +11,11 @@ carries the fix (`did_you_mean`, `available_methods`, `expected` / `actual`).
 
 Design rule: **silence beats noise**. A call is reported only when the
 verifier resolved the receiver to a concrete class whose member surface it
-could fully reconstruct. Unresolved bases, ``__getattr__`` hooks, ``*args``
-unpacking and dynamically decorated callables all cause the check to be
-skipped rather than guessed.
+could fully reconstruct *and* proved the member absent. Unresolved bases,
+``__getattr__`` hooks, ``*args``/``**kwargs`` unpacking, dynamically
+decorated callables, and arities that keyword arguments could satisfy all
+cause the check to be skipped rather than guessed — a false positive costs an
+agent a wrong edit, which is worse than a missed one.
 """
 
 from __future__ import annotations
@@ -25,11 +27,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from honestcode.structure.extractor import StructureExtractor
-from honestcode.structure.utils import call_name, module_name_for
+from honestcode.structure.utils import (
+    call_name,
+    module_name_for,
+    stdlib_resolves,
+    stdlib_roots,
+)
 from honestcode.verify.evidence import (
     ACTION_INSPECT,
     CONFIDENCE_DETERMINISTIC,
-    CONFIDENCE_HIGH,
     KIND_INVENTED_API,
     KIND_SYNTAX_ERROR,
     KIND_UNDEFINED_SYMBOL,
@@ -42,7 +48,7 @@ from honestcode.verify.surface import (
     MethodInfo,
     annotation_name,
     extract_file_surfaces,
-    file_fingerprint,
+    load_file_facts,
 )
 
 if TYPE_CHECKING:
@@ -59,6 +65,7 @@ def valid_imported_names(
     imported_symbols: dict[str, str],
     index: ProjectIndex | None,
     dep_names: set[str],
+    dep_roots: set[str] | None = None,
 ) -> set[str]:
     """Return imported names that resolve to a known project or dependency symbol.
 
@@ -68,10 +75,21 @@ def valid_imported_names(
 
     * the source symbol exists in the project index,
     * the source is a known project module (``import lib.api``),
-    * the source root is a known dependency package (``import numpy as np``), or
+    * the name is re-exported by a project module (``from .compat import
+      urlparse`` where ``compat`` itself imports it),
+    * the source root is a known dependency root (``import numpy as np``), or
     * the full source is a known dependency API (``from math import sqrt``).
+
+    Standard-library sources get one extra guarantee: they are real, importable
+    code, so the attribute is verified against the live module — ``from typing
+    import TypeVarr`` is rejected while ``from typing import TypeVar`` passes.
+    Third-party roots are trusted wholesale when they were merely declared
+    (they may not be installed, so the name cannot be checked) — *dep_roots*
+    supplies those root names; when omitted they are derived from *dep_names*.
     """
     valid: set[str] = set()
+    roots = dep_roots if dep_roots is not None else {n.split(".", 1)[0] for n in dep_names}
+    stdlib = stdlib_roots()
     if index is None:
         # No project index: fall back to the old trusting behaviour.
         for local_name, source_name in imported_symbols.items():
@@ -94,17 +112,30 @@ def valid_imported_names(
             continue
 
         root = source_name.split(".")[0]
-        if root in dep_names:
+
+        # Project-grounded first, so a project that shadows a stdlib or
+        # dependency name still resolves through the index.
+        if source_name in index.symbols or source_name in project_modules:
             valid.add(local_name)
+            continue
+        mod, _, attr = source_name.rpartition(".")
+        if attr and mod and attr in index.module_symbols.get(mod, ()):
+            # Re-export through a project module: ``from .compat import
+            # urlparse`` where compat.py itself imports it. The name is not a
+            # symbol of that module (it is an import there) but it is bound at
+            # its top level, so the importing file is grounded.
+            valid.add(local_name)
+            continue
+
+        if root in roots:
             valid.add(root)
+            if root in stdlib and "." in source_name and stdlib_resolves(source_name) is False:
+                # The stdlib module imports fine but lacks this attribute —
+                # an invented standard-library symbol.
+                continue
+            valid.add(local_name)
             continue
         if source_name in dep_names:
-            valid.add(local_name)
-            continue
-        if source_name in index.symbols:
-            valid.add(local_name)
-            continue
-        if source_name in project_modules:
             valid.add(local_name)
             continue
         if root in project_roots:
@@ -195,22 +226,34 @@ class SurfaceStore:
         self.index = index
         self.local_classes = local_classes or {}
         self.local_functions = local_functions or {}
-        self._parsed: dict[Path, tuple[tuple[int, int], tuple[dict, dict]]] = {}
+        self._imported: dict[Path, dict[str, str]] = {}
         self._resolvers: dict[Path, NameResolver] = {}
 
-    def _surfaces_for(self, path: Path) -> tuple[dict[str, ClassSurface], dict[str, MethodInfo]]:
-        fingerprint = file_fingerprint(path)
-        cached = self._parsed.get(path)
-        if cached is not None and cached[0] == fingerprint:
-            return cached[1]
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, UnicodeDecodeError):
-            return {}, {}
+    def _facts_for(
+        self, path: Path
+    ) -> tuple[dict[str, ClassSurface], dict[str, MethodInfo], dict[str, str]]:
+        """Return cached ``(classes, functions, imports)`` for *path*.
+
+        The shared ``load_file_facts`` cache is keyed by (path, mtime, size),
+        so a file is parsed once per edit no matter how many classes, bases,
+        or verifications reference it.
+        """
         module = module_name_for(path, self.root) if self.root else path.stem
-        surfaces = extract_file_surfaces(tree, module=module, file_label=str(path))
-        self._parsed[path] = (fingerprint, surfaces)
-        return surfaces
+        return load_file_facts(path, module, str(path))
+
+    def _surfaces_for(self, path: Path) -> tuple[dict[str, ClassSurface], dict[str, MethodInfo]]:
+        classes, functions, imported = self._facts_for(path)
+        self._imported[path] = imported
+        return classes, functions
+
+    def imported_for(self, path: Path) -> dict[str, str]:
+        """Imported-symbol map of *path*, from the shared parse cache."""
+        cached = self._imported.get(path)
+        if cached is not None:
+            return cached
+        _classes, _functions, imported = self._facts_for(path)
+        self._imported[path] = imported
+        return imported
 
     def resolver_for(self, path: Path, imported: dict[str, str]) -> NameResolver:
         cached = self._resolvers.get(path)
@@ -285,11 +328,9 @@ class SurfaceStore:
             path = self.root / surface.file
         if not path.exists():
             return None
-        try:
-            imported = StructureExtractor().parse_file(path).imported_symbols or {}
-        except Exception:  # noqa: BLE001 - defensive: unreadable file, skip resolution
-            return None
-        return self.resolver_for(path, imported)
+        # Imported symbols come from the shared parse cache — this used to
+        # re-parse the whole file on every base-class lookup.
+        return self.resolver_for(path, self.imported_for(path))
 
 
 # ── Scope tracking ──────────────────────────────────────────────────────
@@ -357,12 +398,25 @@ class _Verifier:
     resolver: NameResolver
     store: SurfaceStore
     module: str
+    dep_roots: set[str] | None = None
+    dep_enumerated: set[str] | None = None
     findings: list[Finding] = field(default_factory=list)
     checked: int = 0
     _dep_roots: set[str] = field(init=False)
+    _dep_enumerated: set[str] = field(init=False)
 
     def __post_init__(self) -> None:
-        self._dep_roots = {n.split(".", 1)[0] for n in self.dep_names}
+        self._dep_roots = {n.split(".", 1)[0] for n in self.dep_names} | set(self.dep_roots or ())
+        # Member checks need a module whose surface was actually enumerated;
+        # a declared-but-uninstalled package knows nothing about its members,
+        # so ``tomllib.loads`` on a declared-but-absent ``tomli`` must stay
+        # silent rather than be reported as invented.
+        if self.dep_enumerated is not None:
+            self._dep_enumerated = set(self.dep_enumerated)
+        else:
+            self._dep_enumerated = {n for n in self.dep_names if "." not in n} | {
+                r for r in self._dep_roots if r in self.dep_names
+            }
 
     # -- helpers ---------------------------------------------------------
     def _finding(self, **kwargs: Any) -> None:
@@ -480,15 +534,25 @@ class _Verifier:
             self._check_arity(call, f"{self._display(qname)}()", info)
 
     def _check_dependency_call(self, call: ast.Call, receiver: str, attr: str) -> bool:
-        """Verify ``alias.attr()`` against the dependency API index."""
+        """Verify ``alias.attr()`` against the dependency API index.
+
+        Only modules whose member surface was actually enumerated are checked:
+        for a declared-but-uninstalled package, or a submodule the loader never
+        walked into, "not in the index" is not evidence of absence.
+        """
         if not self._dep_roots:
             return False
         module = receiver if receiver in self._dep_roots else None
         if module is None:
             mapped = self.resolver.imported.get(receiver)
             if mapped and mapped.split(".")[0] in self._dep_roots:
-                module = mapped.split(".")[0]
-        if module is None:
+                # Use the FULL mapped source, not its root: for
+                # ``from numpy import random; random.seed()`` the check must
+                # run against ``numpy.random.seed``, not ``numpy.seed``.
+                # Collapsing to the root used to flag perfectly valid calls
+                # on aliased submodules as invented APIs.
+                module = mapped
+        if module is None or module not in self._dep_enumerated:
             return False
 
         full = f"{module}.{attr}"
@@ -525,12 +589,18 @@ class _Verifier:
                 self._check_arity(call, f"{owner}.{attr}()", info)
             return
 
-        public = self._public(view.members)
-        near = get_close_matches(attr, public, n=1, cutoff=_NEAR_MISS_CUTOFF)
-        if not view.complete and not near:
-            # An unresolved base may legitimately provide this member.
+        if not view.complete:
+            # An unresolved base (a stdlib ABC, a third-party parent) may
+            # legitimately provide this member, so absence cannot be proven.
+            # Reporting anyway used to produce false "high confidence"
+            # findings on real code — e.g. ``CaseInsensitiveDict.items()``,
+            # supplied by the unresolvable ``MutableMapping`` base, was
+            # reported with ``did_you_mean: lower_items``.
             return
+
+        public = self._public(view.members)
         evidence: dict[str, Any] = {"available_methods": public[:MAX_EVIDENCE_METHODS]}
+        near = get_close_matches(attr, public, n=1, cutoff=_NEAR_MISS_CUTOFF)
         if near:
             evidence["did_you_mean"] = near[0]
         self._finding(
@@ -540,7 +610,7 @@ class _Verifier:
             owner=owner,
             message=f"`{owner}.{attr}()` does not exist.",
             evidence=evidence,
-            confidence=CONFIDENCE_DETERMINISTIC if view.complete else CONFIDENCE_HIGH,
+            confidence=CONFIDENCE_DETERMINISTIC,
         )
 
     def _check_arity(self, call: ast.Call, label: str, info: MethodInfo) -> None:
@@ -548,23 +618,37 @@ class _Verifier:
             return  # Properties are accessed, not called.
         if not info.arity_trustworthy:
             return  # A decorator may have rewritten the signature.
-        if info.has_varargs and info.has_kwargs:
-            return  # Signature cannot be bounded statically.
         if any(isinstance(a, ast.Starred) for a in call.args):
             return  # Caller unpacks a sequence — count is unknown.
 
         positional = len(call.args)
-        keywords = [kw.arg for kw in call.keywords if kw.arg is not None]
+        keyword_names = [kw.arg for kw in call.keywords if kw.arg is not None]
+        keyword_set = set(keyword_names)
         has_starstar = any(kw.arg is None for kw in call.keywords)
 
-        if positional < info.min_args:
-            self._arity_finding(call, label, info, positional, "too few arguments")
-            return
+        # Too many positional arguments is an error no matter how the call
+        # spells its keywords.
         if info.max_args is not None and positional > info.max_args:
-            self._arity_finding(call, label, info, positional, "too many arguments")
+            self._arity_finding(call, label, info, positional, keyword_names, "too many arguments")
             return
-        if keywords and not info.has_kwargs and not has_starstar:
-            unknown = [k for k in keywords if k not in info.keywords]
+
+        # Too few: required parameters may also be satisfied by keyword —
+        # ``f(a, b)`` called as ``f(a=1, b=2)`` is valid, and keyword-call
+        # style is the norm in modern Python (``verify_tree(tree, path=...)``).
+        if not has_starstar:
+            unfilled = info.required_positional[positional:]
+            missing = [n for n in unfilled if n not in keyword_set]
+            missing += [n for n in sorted(info.required_keywords) if n not in keyword_set]
+            # **kwargs on the definition cannot fill *named* required
+            # parameters, so a missing name is still conclusive.
+            if missing:
+                self._arity_finding(
+                    call, label, info, positional, keyword_names, "too few arguments"
+                )
+                return
+
+        if keyword_names and not info.has_kwargs and not has_starstar:
+            unknown = [k for k in keyword_names if k not in info.keywords]
             if unknown:
                 self._finding(
                     line=call.lineno,
@@ -583,15 +667,20 @@ class _Verifier:
         call: ast.Call,
         label: str,
         info: MethodInfo,
-        actual: int,
+        positional: int,
+        keyword_names: list[str],
         problem: str,
     ) -> None:
+        if keyword_names:
+            actual = f"{positional} positional + {len(keyword_names)} keyword argument(s)"
+        else:
+            actual = f"{positional} argument(s)"
         self._finding(
             line=call.lineno,
             kind=KIND_WRONG_CALL,
             symbol=label,
             message=f"`{label}` called with {problem}: expected {info.describe()}, got {actual}.",
-            evidence={"expected": info.describe(), "actual": f"{actual} argument(s)"},
+            evidence={"expected": info.describe(), "actual": actual},
         )
 
 
@@ -604,8 +693,16 @@ def verify_tree(
     defined: set[str],
     dep_names: set[str],
     imported_symbols: dict[str, str],
+    dep_roots: set[str] | None = None,
+    dep_enumerated: set[str] | None = None,
 ) -> tuple[list[Finding], int]:
-    """Verify every call site in *tree* and return ``(findings, checked)``."""
+    """Verify every call site in *tree* and return ``(findings, checked)``.
+
+    *dep_roots* optionally supplies trusted dependency root names beyond those
+    derivable from *dep_names* (see :func:`valid_imported_names`);
+    *dep_enumerated* lists the dependency modules whose member surface is
+    known, which is what makes invented-API reporting sound.
+    """
     module = module_name_for(path, root) if root else path.stem
     local_classes, local_functions = extract_file_surfaces(
         tree, module=module, file_label=str(path)
@@ -621,6 +718,8 @@ def verify_tree(
         index=index,
         defined=defined,
         dep_names=dep_names,
+        dep_roots=dep_roots,
+        dep_enumerated=dep_enumerated,
         resolver=resolver,
         store=store,
         module=module,

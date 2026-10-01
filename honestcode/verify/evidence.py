@@ -21,10 +21,12 @@ finding is therefore emitted in a fixed, machine-consumable shape:
 
 Two invariants keep the protocol honest:
 
-* ``confidence`` is never inflated. ``deterministic`` is used only when the
-  verifier could prove the claim from the repository alone (the owning class
-  was resolved and its member surface is complete). Anything inferred through
-  an unresolved base class is downgraded to ``high``.
+* ``confidence: deterministic`` is used only when the verifier could prove the
+  claim from the repository alone (the owning class was resolved and its
+  member surface is complete). Findings that would have to be inferred through
+  an unresolved base class are **not reported at all** — absence cannot be
+  proven there, and real-world testing showed that guessing produces
+  misleadingly confident false positives (v0.4.0).
 * ``action`` tells the agent what to do next, so it does not have to guess
   whether a finding is fatal or advisory.
 """

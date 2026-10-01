@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from honestcode import honest, mcp, sandbox, structure
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 __all__ = ["honest", "mcp", "sandbox", "structure"]
 
 

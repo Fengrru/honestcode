@@ -11,8 +11,11 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      # Vendored upstream sources must stay byte-identical to the snapshot.
       - id: trailing-whitespace
+        exclude: ^benchmarks/realworld_fp/vendor/
       - id: end-of-file-fixer
+        exclude: ^benchmarks/realworld_fp/vendor/
       - id: check-yaml
       - id: check-toml
       - id: check-added-large-files

@@ -12,6 +12,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from honestcode.structure.utils import module_name_for
+
 if TYPE_CHECKING:
     from honestcode.mcp.knowledge_base import APIKnowledgeBase
 
@@ -148,7 +150,7 @@ class HonestRouter:
         if "." in call:
             return self._check_api(call)
 
-        if call in self.project_symbols:
+        if self._has_symbol(call):
             return {"call": call, "valid": True, "source": "project"}
 
         if call in self.dep_symbols:
@@ -171,6 +173,19 @@ class HonestRouter:
             "suggestions": suggestions,
         }
 
+    def _has_symbol(self, name: str) -> bool:
+        """True when *name* matches a project symbol by full or trailing name.
+
+        ``project_symbols`` is keyed by qualified name (``pkg.mod.helper``)
+        while callers naturally ask about the short name (``helper``), so the
+        trailing component is matched too. Generous on purpose: a false "valid"
+        costs nothing, a false "risk: high" sends the agent chasing a ghost.
+        """
+        if name in self.project_symbols:
+            return True
+        suffix = f".{name}"
+        return any(key.endswith(suffix) for key in self.project_symbols)
+
     def _module_of(self, file_path: str | Path) -> str:
         """Infer a Python module name from a file path relative to the project root.
 
@@ -181,20 +196,10 @@ class HonestRouter:
         # Prefer project-relative path.
         if self.project_root:
             try:
-                rel = p.resolve().relative_to(self.project_root.resolve())
+                p.resolve().relative_to(self.project_root.resolve())
+                return module_name_for(p, self.project_root)
             except ValueError:
-                rel = p
-        else:
-            rel = p
+                pass
 
-        parts = list(rel.with_suffix("").parts)
-
-        # Only strip "src" if it is a real layout prefix (has sub-packages after it).
-        if len(parts) > 1 and parts[0] == "src":
-            parts = parts[1:]
-
-        # __init__.py represents the package itself.
-        if parts and parts[-1] == "__init__":
-            parts.pop()
-
+        parts = list(p.with_suffix("").parts)
         return ".".join(parts)

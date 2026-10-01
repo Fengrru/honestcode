@@ -92,8 +92,14 @@ class StructureExtractor:
         imports: set[str],
         imported_symbols: dict[str, str],
         edges: list[StructEdge],
+        in_function: bool = False,
     ) -> None:
-        """Recursively walk the AST collecting definitions and edges."""
+        """Recursively walk the AST collecting definitions and edges.
+
+        ``in_function`` gates variable recording: assignments inside a function
+        body are locals, not project symbols, so they are skipped (module-level
+        and class-body assignments are still recorded).
+        """
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 name = self._scoped_name(scope, child.name)
@@ -109,6 +115,7 @@ class StructureExtractor:
                     imports=imports,
                     imported_symbols=imported_symbols,
                     edges=edges,
+                    in_function=True,
                 )
             elif isinstance(child, ast.ClassDef):
                 name = self._scoped_name(scope, child.name)
@@ -124,6 +131,9 @@ class StructureExtractor:
                     imports=imports,
                     imported_symbols=imported_symbols,
                     edges=edges,
+                    # Class bodies hold class attributes, not function locals —
+                    # even when the class itself is nested in a function.
+                    in_function=False,
                 )
             elif isinstance(child, ast.Import):
                 for alias in child.names:
@@ -139,10 +149,10 @@ class StructureExtractor:
                 for alias in child.names:
                     asname = alias.asname or alias.name
                     imported_symbols[asname] = f"{module}.{alias.name}" if module else alias.name
-            elif isinstance(child, ast.Assign):
+            elif isinstance(child, ast.Assign) and not in_function:
                 for target in child.targets:
                     self._record_var_def(target, scope, var_defs)
-            elif isinstance(child, ast.AnnAssign):
+            elif isinstance(child, ast.AnnAssign) and not in_function:
                 if child.target is not None:
                     self._record_var_def(child.target, scope, var_defs)
             else:
@@ -156,6 +166,7 @@ class StructureExtractor:
                     imports=imports,
                     imported_symbols=imported_symbols,
                     edges=edges,
+                    in_function=in_function,
                 )
 
     def _record_var_def(
@@ -175,6 +186,24 @@ class StructureExtractor:
     def _scoped_name(scope: str, name: str) -> str:
         return f"{scope}.{name}" if scope else name
 
+    @staticmethod
+    def _iter_own_scope(node: ast.AST):
+        """Yield every node under *node* without entering nested scopes.
+
+        Nested ``FunctionDef`` / ``ClassDef`` nodes are yielded but not
+        descended into — each of them gets its own ``_collect_local_edges``
+        pass when ``_walk`` reaches it. Walking full subtrees here made
+        extraction quadratic: a 3000-line file took ~0.7s because every
+        enclosing scope re-walked all of its descendants (313k AST visits
+        for one parse).
+        """
+        stack = list(ast.iter_child_nodes(node))
+        while stack:
+            cur = stack.pop()
+            yield cur
+            if not isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                stack.extend(ast.iter_child_nodes(cur))
+
     def _collect_local_edges(
         self,
         node: ast.AST,
@@ -187,7 +216,7 @@ class StructureExtractor:
         """Create edges from references inside *node* to locally defined symbols."""
         local_names = set(func_defs.keys()) | set(class_defs.keys()) | set(var_defs.keys())
 
-        for child in ast.walk(node):
+        for child in self._iter_own_scope(node):
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
                 if child.id in local_names:
                     edges.append(

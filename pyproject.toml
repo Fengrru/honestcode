@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "honestcode"
-version = "0.3.0"
+version = "0.4.0"
 description = "The deterministic verification layer for AI coding agents. Catch invented APIs, undefined symbols, and wrong calls before your agent moves on."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,7 +53,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-cov>=4.0",
-    "ruff>=0.5.0",
+    "ruff>=0.6",
     "pre-commit>=3.0",
 ]
 multi-language = [
@@ -87,6 +87,9 @@ addopts = "-q --tb=short"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# The real-world benchmark vendors upstream source verbatim (see
+# benchmarks/realworld_fp/README.md); it is fixture data, not our code.
+extend-exclude = ["benchmarks/realworld_fp/vendor"]
 
 [tool.ruff.lint]
 select = [
@@ -97,7 +100,7 @@ select = [
     "B",    # flake8-bugbear
     "UP",   # pyupgrade
     "SIM",  # flake8-simplify
-    "TCH",  # flake8-type-checking
+    "TC",   # flake8-type-checking (formerly TCH)
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)

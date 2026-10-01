@@ -82,6 +82,22 @@ jobs:
       - name: Agent-accuracy benchmark
         run: python benchmarks/agent_accuracy/run.py --format text
 
+  benchmark-realworld:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Real-world false-positive benchmark
+        run: python benchmarks/realworld_fp/run.py --format text
+
   benchmark-performance:
     runs-on: ubuntu-latest
     steps:

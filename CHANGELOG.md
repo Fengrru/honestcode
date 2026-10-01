@@ -5,6 +5,170 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-01
+
+Real-world precision and performance release. A scan of `psf/requests` used to
+produce 125 findings — nearly all false positives — and took up to 31 seconds
+per large file. It now produces **zero findings** and verifies the whole corpus
+in seconds; a vendored real-world benchmark (`benchmarks/realworld_fp/`) locks
+the behaviour into CI. Detection recall is unchanged (agent-accuracy
+benchmark: precision 1.0, recall 1.0).
+
+### Fixed — false positives on real-world code
+
+- **Standard-library imports are trusted — and checked exactly.** `from typing
+  import TypeVar`, `from logging import NullHandler`, `from base64 import
+  b64encode` were reported as undefined symbols because the stdlib was never a
+  known dependency root. Stdlib sources are now verified against the live
+  module, so valid names pass and invented ones (`from typing import TypeVarr`)
+  are still rejected.
+- **Keyword arguments satisfy required parameters.** `f(a, b)` called as
+  `f(a=1, b=2)` was reported as "too few arguments: got 0". Arity checks now
+  count parameters passed by keyword (including keyword-only parameters), so
+  the keyword-heavy call style of modern Python — and of this project's own
+  code — is no longer flagged.
+- **`@staticmethod` members use the correct arity.** Static methods were
+  treated as bound methods, shifting their arity by one and flagging valid
+  calls like `RequestEncodingMixin._encode_params(data)`.
+- **Classes with unresolvable bases stay silent.** A base class outside the
+  project (stdlib ABCs such as `MutableMapping`, third-party parents) may
+  legitimately provide any member, so absence cannot be proven. The previous
+  "report with confidence: high" policy produced misleading findings on real
+  code (`CaseInsensitiveDict.items()`, `did_you_mean: lower_items`); the
+  verifier now follows its own silence-beats-noise rule.
+- **Re-exports through project modules are grounded.** `from .compat import
+  urlparse` — where `compat.py` itself imports the name — was rejected as an
+  undefined symbol. The index now records each module's top-level bound names
+  (definitions plus imported aliases), and such imports resolve.
+- **Marker-less projects are still grounded.** A scratch directory with no
+  `.git`/`pyproject.toml` was not auto-indexed, so `verify_file` silently
+  returned `pass` for broken code; it now falls back to the file's own
+  directory.
+
+### Fixed — performance
+
+- **Extraction is linear.** Edge collection walked the full subtree of every
+  function and class, making extraction quadratic (~0.7s for a 3000-line file,
+  313k AST visits). Each scope is now walked exactly once.
+- **Files are parsed once, not 40 times.** The surface store re-parsed the
+  same file for every base-class lookup within a single verification. Parsed
+  facts (classes, functions, imports) are now cached by `(path, mtime, size)`
+  and shared across verifications in the process — `requests/models.py`
+  dropped from 31.2s to ~1.2s, the whole corpus to ~280ms/file.
+
+### Added
+
+- **`benchmarks/realworld_fp/`** — scans a vendored snapshot of `psf/requests`
+  (Apache-2.0, commit pinned in `vendor/.upstream-commit`) and fails CI on any
+  finding. Every false-positive class above is represented in that corpus.
+- `load_project_deps(..., import_packages=False)` registers declared
+  dependencies without importing them (used by the benchmark and useful for
+  hermetic analysis).
+- `tests/test_verify.py` now pins the stricter contract: near-miss typos on
+  complete surfaces are still reported; on incomplete surfaces the verifier
+  stays silent.
+
+### Changed
+
+- `confidence: high` findings are no longer emitted for classes with
+  unresolved bases — the verifier stays silent instead (see above).
+- The agent-accuracy `high_confidence_typo_with_unresolved_base` expectation
+  was replaced by `near_miss_typo_on_complete_surface_is_reported` to match.
+
+## [0.3.2] - 2026-10-01
+
+Fixes two regressions found during real-world evaluation against
+`psf/requests`; each is locked down by a regression test.
+
+### Fixed
+
+- **Nested explicit project roots lost to marker discovery** — a directory
+  indexed explicitly with `index_project` (e.g. `demos/invented-api`) that
+  lives inside a larger project with a `.git` marker was verified against the
+  *enclosing* project's index, so its local module names stopped resolving and
+  findings were silently dropped. The nearest explicitly indexed root now
+  wins over upward marker discovery. (`demos/invented-api` reported
+  "verification passed" for the invented `UserClient.refresh_token()` call.)
+- **Declared-but-uninstalled dependencies were treated as known-empty
+  modules** — a package listed in `requirements.txt`/`pyproject.toml` that
+  could not be imported (`tomli` on Python ≥ 3.11) has no enumerated member
+  surface, but member calls on it were still checked against an empty API set
+  and reported as invented (`tomllib.loads() does not exist`). Member checks
+  now require the module to be in the KB's enumerated set; the same gate also
+  removes false positives on deep submodules and module-attribute receivers
+  (`urllib3.contrib.pyopenssl.*`, `charset_normalizer.__version__.*`) that the
+  one-level loader never walked into.
+
+## [0.3.1] - 2026-10-01
+
+Correctness release: five real-world false-positive / correctness bugs in the
+verification loop are fixed, each locked down by a regression test and an
+agent-accuracy benchmark task.
+
+### Fixed
+
+- **Stale-index false positives** — the in-process symbol index never
+  invalidated, so a symbol written after the first scan (the typical
+  agent flow: write module A, then module B importing it) was reported as
+  `undefined_symbol` with `deterministic` confidence. `get_project_index` now
+  validates its cache against each file's `(mtime_ns, size)` on every access
+  and rebuilds incrementally (unchanged files reuse their parsed symbols).
+  The file watcher's auto re-index relied on the same broken cache and was a
+  no-op; it now picks up changes.
+- **Dependency submodule aliases** — `from numpy import random; random.seed()`
+  was flagged as `invented_api` (`numpy.seed() does not exist`) because the
+  import mapping was collapsed to its root module. The check now runs against
+  the full mapped source (`numpy.random.seed`).
+- **PyPI name vs import name** — `load_package("PyYAML")` tried to
+  `import PyYAML` and failed, so every `from yaml import safe_load` became a
+  false `undefined_symbol`. Distribution names now resolve through
+  `importlib.metadata` (plus a fallback table: Pillow→PIL,
+  scikit-learn→sklearn, …), private C-extension modules (`_yaml`) are tried
+  last, and a declared-but-uninstalled dependency keeps its imports trusted
+  instead of producing findings.
+- **`find_dead_code` reported live entry points as dead** — definitions are
+  keyed by qualified name while references are keyed as written in source, so
+  the two key spaces almost never intersect (1119 false deaths on the
+  project's own codebase). References are now additionally recorded under
+  their import-resolved qualified names, and aliveness matching falls back to
+  the trailing name component.
+- **`search_code` dropped matches when narrowing via FTS5** — token-prefix
+  candidate selection missed regex matches inside longer tokens
+  (`erifica` found nothing although `verification` did). The FTS table now
+  uses the trigram tokenizer and narrows only when a required literal
+  substring can be conservatively derived from the pattern; otherwise it
+  falls back to a full scan.
+- **Syntax errors bypassed the evidence protocol** — `verify_file` returned a
+  bare `{"success": false, "error": ...}`; a syntax error is now a structured
+  `syntax_error` finding like any other kind.
+- **Non-Python scans were pure noise** — every call to a name imported from
+  another module was reported as `undefined_call`. The heuristic path now
+  recognizes per-language imports, declarations, builtins, and keywords, and
+  marks findings `confidence: low`.
+- **Symbol index pollution** — function-local variables were indexed as
+  project symbols (breaking `check_symbol` semantics and bloating the index);
+  only module-level and class-level definitions are indexed now.
+- **Windows sandbox did not match its documentation** — the docstring claimed
+  Job Object limits that were never implemented. Job Objects (process memory,
+  job CPU time, kill-on-close) are now actually applied via ctypes, env
+  scrubbing covers database URL/DSN names, and the module documents its real
+  threat model (a guardrail against accidents, not a security boundary).
+
+### Changed
+
+- `scan_file` grounds each file against the index of the project the file
+  belongs to, so one session scanning two projects no longer grounds one with
+  the other's index.
+- `HonestRouter.check_call` matches project symbols by trailing name as well
+  as by qualified name.
+- One shared implementation of module-name inference
+  (`honestcode.structure.utils.module_name_for`) replaces four copies.
+- `honestcode verify` CLI gains `--version`; ruff's `TCH` rule set is renamed
+  to `TC` (requires ruff ≥ 0.6).
+- Agent-accuracy benchmark: episodes stage multi-file trees and can reset
+  dependency state; two new tasks cover the stale-index and dependency-alias
+  regressions (6 tasks total).
+
 ## [0.3.0] - 2026-08-31
 
 ### Changed

@@ -18,16 +18,25 @@ from __future__ import annotations
 
 import ast
 import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from honestcode.structure.utils import call_name
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
-__all__ = ["MethodInfo", "ClassSurface", "FunctionInfo", "extract_file_surfaces"]
+__all__ = [
+    "MethodInfo",
+    "ClassSurface",
+    "FunctionInfo",
+    "extract_file_surfaces",
+    "imported_symbols_of",
+    "load_file_facts",
+]
 
 # Bases whose member set is empty and safe to treat as fully resolved.
 EMPTY_BASES = frozenset({"object"})
@@ -60,6 +69,11 @@ class MethodInfo:
     has_kwargs: bool = False
     decorators: frozenset[str] = frozenset()
     is_property: bool = False
+    # Required parameter names, so an arity check can count parameters passed
+    # by keyword — ``f(a, b)`` called as ``f(a=1, b=2)`` is valid Python, and
+    # keyword-call style dominates modern code.
+    required_positional: tuple[str, ...] = ()
+    required_keywords: frozenset[str] = frozenset()
 
     @property
     def decorated(self) -> bool:
@@ -128,20 +142,35 @@ def _arity(
     *,
     bound_params: int,
 ) -> MethodInfo:
-    """Compute callable facts for *node*, dropping *bound_params* leading args."""
+    """Compute callable facts for *node*, dropping *bound_params* leading args.
+
+    ``@staticmethod`` methods take no implicit first parameter, so the drop is
+    forced to zero for them — treating ``self`` as bound used to shift every
+    static method's arity by one and flag valid calls
+    (``RequestEncodingMixin._encode_params(data)`` reported "expected 0").
+    ``@classmethod`` keeps the drop (``cls`` is bound).
+    """
     a = node.args
+    names = [_decorator_name(d) for d in node.decorator_list]
+    short_decorators = {n.split(".")[-1] for n in names if n}
+    if "staticmethod" in short_decorators:
+        bound_params = 0
+
     pos = list(getattr(a, "posonlyargs", []) or []) + list(a.args)
     n_defaults = len(a.defaults)
     required_pos = len(pos) - n_defaults
     kwonly = list(a.kwonlyargs)
-    required_kw = sum(1 for arg, dflt in zip(kwonly, a.kw_defaults, strict=False) if dflt is None)
+    required_kw_names = frozenset(
+        arg.arg for arg, dflt in zip(kwonly, a.kw_defaults, strict=False) if dflt is None
+    )
 
     drop = min(bound_params, len(pos))
-    min_args = max(0, required_pos - drop) + required_kw
+    after_drop = pos[drop:]
+    required_positional = tuple(x.arg for x in after_drop[: max(0, required_pos - drop)])
+    min_args = len(required_positional) + len(required_kw_names)
     max_args = None if a.vararg is not None else max(0, len(pos) - drop) + len(kwonly)
     keywords = frozenset([x.arg for x in pos[drop:]] + [x.arg for x in kwonly])
 
-    names = [_decorator_name(d) for d in node.decorator_list]
     return MethodInfo(
         name=node.name,
         min_args=min_args,
@@ -151,6 +180,8 @@ def _arity(
         has_kwargs=a.kwarg is not None,
         decorators=frozenset(n for n in names if n),
         is_property=any(n.split(".")[-1] in ("property", "cached_property") for n in names),
+        required_positional=required_positional,
+        required_keywords=required_kw_names,
     )
 
 
@@ -282,3 +313,80 @@ def file_fingerprint(path: Path) -> tuple[int, int]:
     except OSError:
         return (0, 0)
     return (int(st.st_mtime_ns), int(st.st_size))
+
+
+def imported_symbols_of(tree: ast.AST) -> dict[str, str]:
+    """Map every imported local name in *tree* to its source.
+
+    Mirrors :class:`~honestcode.structure.extractor.StructureExtractor`'s
+    convention (``import a.b`` binds ``b`` -> ``a.b``; ``from a import name``
+    binds ``name`` -> ``a.name``). Local imports inside functions count too.
+    """
+    out: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                asname = alias.asname or alias.name.split(".")[-1]
+                out[asname] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                asname = alias.asname or alias.name
+                out[asname] = f"{module}.{alias.name}" if module else alias.name
+    return out
+
+
+# Parsed file facts shared across verifications: definition files are read
+# once per (path, mtime, size) even though a single verify walks dozens of
+# classes, and long-lived MCP sessions reuse everything across calls.
+# Ordering matters: this used to happen once per class-base lookup, which
+# parsed the same multi-thousand-line file 40 times in one verification.
+_MAX_CACHED_FILES = 512
+_FILE_FACTS: OrderedDict[
+    tuple[str, int, int],
+    tuple[dict[str, ClassSurface], dict[str, MethodInfo], dict[str, str]],
+] = OrderedDict()
+
+
+@lru_cache(maxsize=4096)
+def _read_source(path_str: str) -> str | None:
+    """Cached source read (bounded); ``None`` when unreadable."""
+    try:
+        return Path(path_str).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def load_file_facts(
+    path: Path,
+    module: str,
+    file_label: str,
+) -> tuple[dict[str, ClassSurface], dict[str, MethodInfo], dict[str, str]]:
+    """Parse *path* once and return ``(classes, functions, imported_symbols)``.
+
+    Results are cached by ``(path, mtime_ns, size)`` across calls; unreadable
+    or unparsable files cache an empty result so repeated scans do not retry.
+    """
+    key = (str(path), *file_fingerprint(path))
+    cached = _FILE_FACTS.get(key)
+    if cached is not None:
+        _FILE_FACTS.move_to_end(key)
+        return cached
+
+    source = _read_source(str(path))
+    facts: tuple[dict[str, ClassSurface], dict[str, MethodInfo], dict[str, str]]
+    if source is None:
+        facts = ({}, {}, {})
+    else:
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            facts = ({}, {}, {})
+        else:
+            classes, functions = extract_file_surfaces(tree, module=module, file_label=file_label)
+            facts = (classes, functions, imported_symbols_of(tree))
+
+    _FILE_FACTS[key] = facts
+    if len(_FILE_FACTS) > _MAX_CACHED_FILES:
+        _FILE_FACTS.popitem(last=False)
+    return facts

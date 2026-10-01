@@ -37,8 +37,14 @@ from honestcode.mcp.knowledge_base import APIKnowledgeBase
 from honestcode.sandbox import SandboxExecutor
 from honestcode.structure.extractor import StructureExtractor
 from honestcode.structure.relations import ParseResult
-from honestcode.structure.utils import call_name
-from honestcode.verify.evidence import build_report, render_text
+from honestcode.structure.utils import call_name, module_name_for, stdlib_roots
+from honestcode.verify.evidence import (
+    ACTION_INSPECT,
+    KIND_SYNTAX_ERROR,
+    Finding,
+    build_report,
+    render_text,
+)
 from honestcode.verify.verify import valid_imported_names, verify_tree
 
 __all__ = [
@@ -57,6 +63,7 @@ __all__ = [
     "search_code",
     "choose_tool",
     "verify_file",
+    "reset_dependency_state",
 ]
 
 logger = logging.getLogger(__name__)
@@ -84,8 +91,82 @@ def _find_project_root(start: Path) -> Path | None:
     return None
 
 
+# Per-root index memo so scanning files from two projects in one session never
+# grounds one of them with the other's index. Entries hold whatever
+# get_project_index returned last; freshness is re-validated inside it.
+_index_by_root: dict[str, ProjectIndex] = {}
+
+
+def _index_for_file(path: Path) -> ProjectIndex | None:
+    """Resolve the (fresh) project index for the project containing *path*.
+
+    Resolution order:
+    1. the **nearest explicitly indexed root** (a root passed to
+       ``index_project``) that contains *path* — an explicit binding is a
+       deliberate statement of scope and must win over generic upward marker
+       discovery. Nested projects rely on this: a demo directory indexed
+       explicitly inside a git repo must not be verified against the repo
+       root's index, or its local module names stop resolving and findings
+       are silently lost;
+    2. the nearest project above *path* discovered via markers;
+    3. ``None`` (scan_file then falls back to trusting-import behaviour).
+
+    ``get_project_index`` validates its cache against the tree's file metadata
+    on every call, so the returned index always reflects files written moments
+    ago. Per-root memoization additionally keeps a session that touches two
+    projects from grounding one with the other's index.
+    """
+    global _project_index, _project_root
+    if not _AUTO_INDEX_ENABLED:
+        with _state_lock:
+            return _project_index
+
+    resolved = path.resolve()
+    root = _nearest_explicit_root(resolved)
+    if root is None:
+        root = _find_project_root(path)
+    if root is None:
+        # No marker anywhere: index the file's own directory. Agents work in
+        # scratch/workspace directories all the time; giving up here made
+        # verify_file silently return "pass" for broken code. Skip filesystem
+        # roots so we never try to index an entire drive.
+        parent = resolved.parent
+        if parent == parent.parent:
+            return None
+        root = parent
+
+    fresh = get_project_index(root, force_rebuild=False)
+    with _state_lock:
+        _index_by_root[str(root)] = fresh
+        _project_index = fresh
+        _project_root = root
+    return fresh
+
+
+def _nearest_explicit_root(resolved: Path) -> Path | None:
+    """Return the deepest explicitly indexed root containing *resolved*."""
+    with _state_lock:
+        candidates = [Path(r) for r in _index_by_root]
+        proot = _project_root
+    if proot is not None and Path(proot) not in candidates:
+        candidates.append(Path(proot))
+    best: Path | None = None
+    for cand in candidates:
+        try:
+            resolved.relative_to(cand)
+        except ValueError:
+            continue
+        if best is None or len(cand.parts) > len(best.parts):
+            best = cand
+    return best
+
+
 def _ensure_index_for(path: Path) -> bool:
-    """Auto-index the project containing *path* when no index is loaded."""
+    """Auto-index the project containing *path* when no index is loaded.
+
+    Kept for backwards compatibility; ``scan_file`` now uses
+    :func:`_index_for_file`, which is per-project-root and always fresh.
+    """
     global _project_index, _project_root
     with _state_lock:
         if _project_index is not None or not _AUTO_INDEX_ENABLED:
@@ -122,20 +203,10 @@ def _cache_dir() -> Path:
 def _module_name(p: Path, root: Path) -> str:
     """Infer a dotted module name from *p* relative to *root*.
 
-    Only strips the ``src`` prefix when it is a standalone directory component
-    (i.e. the standard ``src`` layout) and there are further path segments.
+    Thin alias for :func:`honestcode.structure.utils.module_name_for` — the
+    single implementation of this logic (it used to be copied in four places).
     """
-    try:
-        rel = p.resolve().relative_to(root.resolve())
-    except ValueError:
-        rel = p
-    parts = list(rel.with_suffix("").parts)
-    # Only strip "src" if it is a real layout prefix (has sub-packages after it).
-    if len(parts) > 1 and parts[0] == "src":
-        parts = parts[1:]
-    if parts and parts[-1] == "__init__":
-        parts.pop()
-    return ".".join(parts)
+    return module_name_for(p, root)
 
 
 def _resolve_relative_module(current_module: str, level: int, target: str) -> str:
@@ -262,6 +333,7 @@ def _build_call_graph(root: Path) -> CallGraph:
         # here: the AST walk below already captures every Name/Attribute/
         # Call reference (with context), and re-adding edges would duplicate
         # caller entries with wrong (definition) line numbers.
+        imported = res.imported_symbols or {}
         try:
             tree = ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
         except SyntaxError:
@@ -270,11 +342,13 @@ def _build_call_graph(root: Path) -> CallGraph:
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 ctx = qualified_by_short.get(node.name, node.name)
-                _record_reference(node, p, graph, ctx)
-                _collect_refs_in(node, p, graph, ctx, qualified_by_short)
+                _record_reference(node, p, graph, ctx, imported, module)
+                _collect_refs_in(node, p, graph, ctx, qualified_by_short, imported, module)
             else:
-                _record_reference(node, p, graph, module or None)
-                _collect_refs_in(node, p, graph, module or None, qualified_by_short)
+                _record_reference(node, p, graph, module or None, imported, module)
+                _collect_refs_in(
+                    node, p, graph, module or None, qualified_by_short, imported, module
+                )
 
     return graph
 
@@ -285,6 +359,8 @@ def _collect_refs_in(
     graph: CallGraph,
     context: str | None,
     qualified_by_short: dict[str, str] | None = None,
+    imported: dict[str, str] | None = None,
+    module: str | None = None,
 ) -> None:
     """Collect call/name references inside *node*, attaching *context*.
 
@@ -304,11 +380,11 @@ def _collect_refs_in(
                     child_ctx = f"{context}.{child.name}" if context else child.name
             else:
                 child_ctx = child.name
-            _record_reference(child, p, graph, child_ctx)
-            _collect_refs_in(child, p, graph, child_ctx, qualified_by_short)
+            _record_reference(child, p, graph, child_ctx, imported, module)
+            _collect_refs_in(child, p, graph, child_ctx, qualified_by_short, imported, module)
         else:
-            _record_reference(child, p, graph, context)
-            _collect_refs_in(child, p, graph, context, qualified_by_short)
+            _record_reference(child, p, graph, context, imported, module)
+            _collect_refs_in(child, p, graph, context, qualified_by_short, imported, module)
 
 
 def _record_reference(
@@ -316,22 +392,45 @@ def _record_reference(
     p: Path,
     graph: CallGraph,
     context: str | None,
+    imported: dict[str, str] | None = None,
+    module: str | None = None,
 ) -> None:
-    """Record a single AST node as a reference if it is a call/name/attribute."""
+    """Record a single AST node as a reference if it is a call/name/attribute.
+
+    When *imported* is given, the reference is additionally recorded under its
+    import-resolved qualified name — ``verify_tree`` written after ``from
+    honestcode.verify.verify import verify_tree`` is stored both as
+    ``verify_tree`` and as ``honestcode.verify.verify.verify_tree``. Without
+    the qualified form, definition-side keys (which are module-qualified) and
+    reference-side keys (which are written as in source) never met, and
+    ``find_dead_code`` reported live entry points as dead.
+    """
+    key: str | None = None
+    kind = "reference"
     if isinstance(child, ast.Call):
-        name = call_name(child.func)
-        if name:
-            graph.references.setdefault(name, []).append((p, child.lineno, "call", context))
+        key = call_name(child.func)
+        kind = "call"
     elif isinstance(child, ast.Name):
         if isinstance(child.ctx, ast.Store):
             return
-        graph.references.setdefault(child.id, []).append((p, child.lineno, "reference", context))
+        key = child.id
     elif isinstance(child, ast.Attribute):
         if isinstance(child.ctx, ast.Store):
             return
-        name = call_name(child)
-        if name:
-            graph.references.setdefault(name, []).append((p, child.lineno, "attribute", context))
+        key = call_name(child)
+        kind = "attribute"
+    if not key:
+        return
+    graph.references.setdefault(key, []).append((p, child.lineno, kind, context))
+    if imported is not None:
+        head, _, rest = key.partition(".")
+        src = imported.get(head)
+        # Only dotted absolute sources qualify; relative-import sources cannot
+        # be resolved reliably here (the leading dots are lost by the parser).
+        if src and "." in src:
+            qual = f"{src}.{rest}" if rest else src
+            if qual != key:
+                graph.references.setdefault(qual, []).append((p, child.lineno, kind, context))
 
 
 # ── Tools ──────────────────────────────────────────────────────────────
@@ -413,6 +512,7 @@ def index_project(root_path: str, force_rebuild: bool = False, watch: bool = Fal
     with _state_lock:
         _project_root = resolved
         _project_index = idx
+        _index_by_root[str(resolved)] = idx
         _invalidate_graph_cache()
     if watch:
         _ensure_watcher(resolved)
@@ -425,8 +525,15 @@ def index_project(root_path: str, force_rebuild: bool = False, watch: bool = Fal
     }
 
 
-def load_project_deps(root_path: str) -> dict:
-    """Load dependency APIs declared in requirements.txt / pyproject.toml."""
+def load_project_deps(root_path: str, import_packages: bool = True) -> dict:
+    """Load dependency APIs declared in requirements.txt / pyproject.toml.
+
+    With ``import_packages=False`` the declared packages are only *registered*
+    (their imports become trusted) without importing them — useful for
+    offline/hermetic analysis and benchmarks, where installing or importing
+    every dependency is undesirable. Member-level invented-API checks stay
+    silent for packages that were declared but not imported.
+    """
     root = Path(root_path)
     loaded: list[str] = []
     for candidate in ("requirements.txt", "pyproject.toml"):
@@ -436,6 +543,10 @@ def load_project_deps(root_path: str) -> dict:
         pkgs = _parse_requires(f)
         for pkg in pkgs:
             try:
+                if not import_packages:
+                    _dep_kb.declare_package(pkg)
+                    loaded.append(pkg)
+                    continue
                 n = _dep_kb.load_package(pkg)
                 if n:
                     loaded.append(pkg)
@@ -622,8 +733,175 @@ def _builtin_names() -> set[str]:
     return set(dir(builtins))
 
 
+# Per-language aids for the heuristic non-Python scan: builtins that are legal
+# to call without a definition in the scanned file, and regexes that surface
+# names the file imports or declares. Without these, every cross-module call
+# was reported as "undefined" — pure noise that violated the project's
+# silence-beats-noise rule.
+_LANG_BUILTINS: dict[str, set[str]] = {
+    "javascript": {
+        "require",
+        "setTimeout",
+        "setInterval",
+        "clearTimeout",
+        "clearInterval",
+        "queueMicrotask",
+        "structuredClone",
+        "fetch",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "isFinite",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "Promise",
+        "URL",
+        "URLSearchParams",
+        "AbortController",
+        "TextEncoder",
+        "TextDecoder",
+        "Proxy",
+        "Reflect",
+        "Symbol",
+        "BigInt",
+        "Date",
+        "RegExp",
+    },
+    "go": {
+        "len",
+        "cap",
+        "make",
+        "new",
+        "append",
+        "copy",
+        "delete",
+        "panic",
+        "recover",
+        "print",
+        "println",
+        "close",
+        "min",
+        "max",
+        "clear",
+    },
+    "rust": {
+        "println",
+        "print",
+        "eprintln",
+        "eprint",
+        "format",
+        "vec",
+        "panic",
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "write",
+        "writeln",
+        "todo",
+        "unimplemented",
+        "matches",
+        "dbg",
+        "env",
+        "concat",
+        "stringify",
+        "include_str",
+        "include_bytes",
+        "cfg",
+    },
+}
+_LANG_BUILTINS["typescript"] = _LANG_BUILTINS["javascript"]
+
+_LANG_IMPORT_PATTERNS: dict[str, list[str]] = {
+    # Each pattern's group(s) yield imported local names.
+    "javascript": [
+        r"import\s*\{([^}]+)\}\s*from",
+        r"import\s*\*\s*as\s+(\w+)",
+        r"import\s+(\w+)\s*(?:,|from)",
+        r"(?:const|let|var)\s*\{([^}]+)\}\s*=\s*require\(",
+        r"(?:const|let|var)\s+(\w+)\s*=\s*require\(",
+    ],
+    "go": [
+        r'import\s+(?:\w+\s+)?"([^"]+)"',
+        r'^\s*(?:\w+\s+)?"([^"]+)"',
+    ],
+    "rust": [
+        r"use\s+[\w:]*::\{([^}]+)\}",
+        r"use\s+([\w:]+)",
+    ],
+    "java": [
+        r"import\s+(?:static\s+)?([\w.]+)\s*;",
+    ],
+}
+_LANG_IMPORT_PATTERNS["typescript"] = _LANG_IMPORT_PATTERNS["javascript"]
+
+# Language keywords / soft keywords that syntactically look like calls.
+_LANG_KEYWORDS: set[str] = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "function",
+    "new",
+    "typeof",
+    "return",
+    "else",
+    "do",
+    "try",
+    "throw",
+    "case",
+    "await",
+    "async",
+    "yield",
+    "delete",
+    "void",
+    "instanceof",
+    "super",
+    "func",
+    "go",
+    "defer",
+    "select",
+    "fn",
+    "match",
+    "loop",
+    "unsafe",
+    "impl",
+    "dyn",
+    "move",
+    "synchronized",
+    "assert",
+}
+
+# Fallback declaration patterns for names tree-sitter may not surface
+# (variables, Go receivers, Java members) — best-effort, silence-biased.
+_LANG_DECL_PATTERNS: dict[str, list[str]] = {
+    "javascript": [
+        r"\b(?:const|let|var)\s+(\w+)",
+        r"\bfunction\s*\*?\s*(\w+)",
+        r"\bclass\s+(\w+)",
+    ],
+    "go": [
+        r"func\s+(?:\([^)]*\)\s*)?(\w+)\s*",
+        r"type\s+(\w+)\s+",
+        r"(?:^|\n)\s*(?:var|const)\s+(\w+)",
+    ],
+    "rust": [r"\blet\s+(?:mut\s+)?(\w+)", r"\b(?:static|const)\s+(\w+)"],
+    "java": [
+        r"\b(?:class|interface|enum)\s+(\w+)",
+        r"\b(?:public|protected|private)\s+[\w<>\[\],.\s]+?\s+(\w+)\s*\([^;)]*\)\s*[;{]",
+    ],
+}
+_LANG_DECL_PATTERNS["typescript"] = _LANG_DECL_PATTERNS["javascript"]
+
+
 def _scan_non_python(p: Path) -> dict:
-    """Scan a non-Python file via the optional tree-sitter multi-language path."""
+    """Scan a non-Python file via the optional tree-sitter multi-language path.
+
+    This path is heuristic by nature: a call is reported only when its name is
+    neither defined in nor imported by the file (and is not a language builtin
+    or keyword), and every finding is marked ``confidence: low`` so agents and
+    humans treat it as a pointer, not a verdict.
+    """
     from honestcode.structure import multi_lang
 
     lang = multi_lang.detect_language(p)
@@ -643,12 +921,38 @@ def _scan_non_python(p: Path) -> dict:
         }
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"multi-language scan failed: {exc}"}
-
-    defined = {s["name"] for s in symbols}
     try:
         source = p.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return {"success": False, "error": f"cannot read file: {exc}"}
+
+    defined = {s["name"] for s in symbols}
+
+    # Imported names: the last segment of the import target (plus, for
+    # multi-name forms, every declared local).
+    import_name_group = _LANG_IMPORT_PATTERNS.get(lang, [])
+    for pat in import_name_group:
+        for m in re.finditer(pat, source, re.MULTILINE):
+            for group in m.groups():
+                if not group:
+                    continue
+                for part in group.split(","):
+                    part = part.strip().split(" as ")[-1].strip()
+                    if part:
+                        defined.add(part.rsplit(":", 1)[-1].rsplit(".", 1)[-1])
+            # `use std::io;` / `import a.b.C;` — the tail is the used name.
+            tail = m.group(0).rstrip(";").split()[-1].strip("\"';,()")
+            if tail and re.fullmatch(r"[\w:./-]+", tail):
+                defined.add(tail.rsplit(":", 1)[-1].rsplit(".", 1)[-1])
+
+    for pat in _LANG_DECL_PATTERNS.get(lang, []):
+        for m in re.finditer(pat, source, re.MULTILINE):
+            for group in m.groups():
+                if group and group.isidentifier():
+                    defined.add(group)
+
+    builtins = _LANG_BUILTINS.get(lang, set())
+    keywords = _LANG_KEYWORDS
 
     issues: list[dict] = []
     # Negative lookbehind skips attribute calls (``obj.method(``), which
@@ -656,20 +960,17 @@ def _scan_non_python(p: Path) -> dict:
     # that look like calls (``new Foo(``, ``require(``, ...).
     for m in re.finditer(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(", source):
         name = m.group(1)
-        if name in defined or name in {
-            "if",
-            "for",
-            "while",
-            "switch",
-            "catch",
-            "function",
-            "new",
-            "typeof",
-            "return",
-        }:
+        if name in defined or name in builtins or name in keywords:
             continue
         line = source[: m.start()].count("\n") + 1
-        issues.append({"type": "undefined_call", "name": name, "line": line})
+        issues.append(
+            {
+                "type": "undefined_call",
+                "name": name,
+                "line": line,
+                "confidence": "low",
+            }
+        )
 
     return {
         "success": True,
@@ -692,19 +993,38 @@ def scan_file(file_path: str) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"success": False, "error": str(e)}
 
-    # Try to ground the file automatically: most agents call scan_file on a
-    # freshly-written path without remembering to call index_project first.
-    _ensure_index_for(p)
+    # Ground the file against a FRESH index of its own project. Most agents
+    # call scan_file on a freshly-written path without remembering to call
+    # index_project first; resolving per-file also keeps a session that touches
+    # several projects from grounding one with another's index.
+    idx = _index_for_file(p)
 
     with _state_lock:
-        idx = _project_index
         dep_names = _dep_kb.all_names()
+        dep_roots = _dep_kb.roots() | {n.split(".", 1)[0] for n in dep_names} | stdlib_roots()
+        dep_enumerated = _dep_kb.enumerated_modules()
 
     try:
         source = p.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(p))
+    except (OSError, UnicodeDecodeError) as e:
+        return {"success": False, "error": f"cannot read file: {e}"}
     except SyntaxError as e:
-        return {"success": False, "error": f"SyntaxError: {e}"}
+        # A syntax error is itself a verification finding, not a tool failure:
+        # the agent needs the structured protocol (status/findings/text) so it
+        # can act on it like any other kind.
+        finding = Finding(
+            file=str(p),
+            line=e.lineno or 1,
+            kind=KIND_SYNTAX_ERROR,
+            symbol="<syntax>",
+            message=f"SyntaxError: {e.msg}",
+            evidence={"offset": e.offset or 0},
+            action=ACTION_INSPECT,
+        )
+        report = build_report(file=str(p), findings=[finding], checked=0)
+        report["defined_symbols"] = 0
+        return report
 
     # Locally defined names (functions/classes/vars + parameters + loop targets).
     defined = _collect_local_defined(tree)
@@ -715,7 +1035,7 @@ def scan_file(file_path: str) -> dict:
     # the loaded dependency API knowledge base.
     module = _module_name(p, Path(idx.root)) if idx is not None else p.stem
     imported_symbols = _normalize_imported_symbols(res.imported_symbols or {}, tree, module)
-    defined |= valid_imported_names(imported_symbols, idx, dep_names)
+    defined |= valid_imported_names(imported_symbols, idx, dep_names, dep_roots)
     # Dependency API names.
     defined |= dep_names
     # Full builtin set instead of a hand-picked subset.
@@ -729,6 +1049,8 @@ def scan_file(file_path: str) -> dict:
         defined=defined,
         dep_names=dep_names,
         imported_symbols=imported_symbols,
+        dep_roots=dep_roots,
+        dep_enumerated=dep_enumerated,
     )
     report = build_report(file=str(p), findings=findings, checked=checked)
     report["defined_symbols"] = len(defined)
@@ -759,6 +1081,16 @@ def load_package_apis(package_name: str) -> dict:
     """Load (and cache) API signatures for a specific package."""
     count = _dep_kb.load_package(package_name)
     return {"success": True, "package": package_name, "api_count": count}
+
+
+def reset_dependency_state() -> dict:
+    """Forget every loaded dependency API and declared root.
+
+    Used by tests and the accuracy benchmark to isolate scenarios; a live MCP
+    session has no reason to call this.
+    """
+    _dep_kb.reset()
+    return {"success": True}
 
 
 def get_project_stats() -> dict:
@@ -938,9 +1270,19 @@ def find_dead_code(
     alive: set[str] = set(entrypoints or [])
 
     # Symbols referenced anywhere in the project are considered alive.
+    # Definitions are keyed by qualified name while references are keyed by
+    # the name as written in source (plus import-resolved qualified aliases —
+    # see _record_reference), so also match on the trailing component.
+    # Deliberately generous: dead-code must err toward silence, and a short
+    # name that matches an unrelated definition only costs a missed report,
+    # never a false one.
+    by_short: dict[str, list[str]] = {}
+    for def_name in graph.definitions:
+        by_short.setdefault(def_name.rsplit(".", 1)[-1], []).append(def_name)
+
     for name in graph.references:
-        if name in graph.definitions:
-            alive.add(name)
+        for def_name in by_short.get(name.rsplit(".", 1)[-1], ()):
+            alive.add(def_name)
 
     if include_tests:
         for name, locations in graph.definitions.items():

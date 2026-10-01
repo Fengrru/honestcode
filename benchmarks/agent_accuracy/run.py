@@ -33,7 +33,12 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from honestcode.mcp.tools import index_project, verify_file  # noqa: E402
+from honestcode.mcp.tools import (  # noqa: E402
+    index_project,
+    load_project_deps,
+    reset_dependency_state,
+    verify_file,
+)
 
 
 class Task:
@@ -57,6 +62,28 @@ class Task:
     @property
     def target_file(self) -> str:
         return self.meta["target_file"]
+
+    @property
+    def broken_extras(self) -> dict[str, str]:
+        return self._episode_extras(self.path / "broken")
+
+    @property
+    def fixed_extras(self) -> dict[str, str]:
+        return self._episode_extras(self.path / "fixed")
+
+    def _episode_extras(self, episode_dir: Path) -> dict[str, str]:
+        """Auxiliary episode files (everything except the ``app.py`` source).
+
+        Multi-file tasks use these to stage what the agent wrote earlier in
+        the session (e.g. the new module a later file imports).
+        """
+        out: dict[str, str] = {}
+        if not episode_dir.exists():
+            return out
+        for f in sorted(episode_dir.rglob("*")):
+            if f.is_file() and f.name != "app.py":
+                out[f.relative_to(episode_dir).as_posix()] = f.read_text(encoding="utf-8")
+        return out
 
     @property
     def expected_kind(self) -> str:
@@ -86,13 +113,19 @@ def _matches_expected(finding: dict[str, Any], task: Task) -> bool:
     return needle in symbol or needle in message
 
 
-def _run_once(task: Task, source: str, root: Path) -> dict[str, Any]:
-    """Write *source* into the task temp root and run verify_file."""
+def _run_once(task: Task, source: str, root: Path, extras: dict[str, str]) -> dict[str, Any]:
+    """Stage *extras* + *source* into the task temp root and run verify_file."""
+    for rel, text in extras.items():
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(text, encoding="utf-8")
     target = root / task.target_file
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(source, encoding="utf-8")
-    # Force a clean index for this synthetic project root.
-    index_project(str(root), force_rebuild=True)
+    # Deliberately NO force_rebuild: index freshness must be validated the
+    # same way an agent session experiences it (files just written, index
+    # possibly stale from before the write).
+    index_project(str(root), force_rebuild=False)
     started = time.perf_counter()
     report = verify_file(str(target))
     elapsed_ms = (time.perf_counter() - started) * 1000
@@ -105,9 +138,28 @@ def evaluate_task(task: Task) -> dict[str, Any]:
         root = Path(td)
         if task.context_dir.exists():
             shutil.copytree(task.context_dir, root, dirs_exist_ok=True)
+        if task.meta.get("reset_deps"):
+            reset_dependency_state()
 
-        broken = _run_once(task, task.broken_source, root)
-        fixed = _run_once(task, task.fixed_source, root)
+        pushed = False
+        if task.meta.get("path_project_root"):
+            # Tasks with a vendored fake dependency need it importable BEFORE
+            # the dependency knowledge base is loaded.
+            sys.path.insert(0, str(root))
+            pushed = True
+        try:
+            if task.meta.get("load_deps"):
+                load_project_deps(str(root))
+            broken = _run_once(task, task.broken_source, root, task.broken_extras)
+            fixed = _run_once(task, task.fixed_source, root, task.fixed_extras)
+        finally:
+            if pushed:
+                sys.path.remove(str(root))
+                for name in list(sys.modules):
+                    mod = sys.modules.get(name)
+                    mod_file = getattr(mod, "__file__", "")
+                    if mod_file and str(root) in mod_file:
+                        sys.modules.pop(name, None)
 
         broken_findings = broken["report"].get("findings", [])
         broken_match = any(_matches_expected(f, task) for f in broken_findings)

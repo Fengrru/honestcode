@@ -1,10 +1,19 @@
 """
 Sandboxed code execution for HonestCode.
 
-Executes untrusted code in a fresh Python subprocess with resource limits:
+Executes code in a fresh Python subprocess with resource limits:
   - POSIX: RLIMIT_AS (memory), RLIMIT_CPU (cpu time), RLIMIT_NOFILE (open files)
-  - Windows: Job object with process/memory limits (best-effort via ctypes)
-  - Both: timeout, isolated temp directory, restricted PYTHONPATH
+  - Windows: Job Object with process-memory and job CPU-time limits, plus
+    kill-on-close, applied via ctypes (best effort; silently skipped when the
+    Job Object API is unavailable)
+  - Both: wall-clock timeout, isolated temp directory, restricted PYTHONPATH
+
+Threat model — read this before trusting it: the sandbox is a guardrail
+against *accidents* (infinite loops, fork bombs, runaway memory, typo'd
+paths), not a security boundary. The child runs as the current user with full
+file-system and network access, and environment scrubbing is name-based
+guesswork. Do not execute code from untrusted authors inside it; use a real
+isolation layer (container, VM) for that.
 """
 
 from __future__ import annotations
@@ -24,8 +33,9 @@ logger = logging.getLogger(__name__)
 __all__ = ["ExecutionResult", "SandboxExecutor"]
 
 # Environment variable names containing these markers are scrubbed before
-# the sandboxed subprocess starts, so secrets (API keys, tokens, passwords)
-# never reach code being executed.
+# the sandboxed subprocess starts. This is best-effort name guessing: it
+# catches the common credential names but cannot know every scheme a secret
+# might hide under (see the threat model above).
 _SENSITIVE_ENV_MARKERS = (
     "KEY",
     "TOKEN",
@@ -35,6 +45,8 @@ _SENSITIVE_ENV_MARKERS = (
     "CREDENTIAL",
     "AUTH",
     "SIGNATURE",
+    "DATABASE",
+    "DSN",
 )
 
 
@@ -104,52 +116,62 @@ class SandboxExecutor:
             creationflags = self._get_creationflags()
 
             try:
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     [sys.executable, "-u", str(script_path)],
                     cwd=tmpdir,
                     env=env,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=self.timeout,
                     preexec_fn=preexec,
                     creationflags=creationflags,
                 )
-                runtime = time.perf_counter() - start
-                stdout = proc.stdout or ""
-                stderr = proc.stderr or ""
-                success = proc.returncode == 0
-                err_text = stderr[:50_000] if not success else ""
-                error_type = ""
-                if not success and err_text:
-                    m = re.search(r"^(\w+Error|\w+Exception)", err_text, re.MULTILINE)
-                    if m:
-                        error_type = m.group(1)
-                return ExecutionResult(
-                    success=success,
-                    stdout=stdout[:50_000],
-                    stderr=stderr[:50_000],
-                    output=stdout[:50_000],
-                    error=err_text,
-                    error_type=error_type,
-                    runtime_seconds=round(runtime, 3),
-                    details={"returncode": proc.returncode, "known_names": sorted(known_names)},
-                )
-            except subprocess.TimeoutExpired as e:
-                runtime = time.perf_counter() - start
-                return ExecutionResult(
-                    success=False,
-                    error=f"Execution timed out after {self.timeout}s",
-                    stderr=e.stderr or "",
-                    runtime_seconds=round(runtime, 3),
-                    details={"timeout": True},
-                )
             except Exception as e:  # noqa: BLE001
-                runtime = time.perf_counter() - start
                 return ExecutionResult(
                     success=False,
                     error=f"Sandbox failed: {e}",
-                    runtime_seconds=round(runtime, 3),
+                    runtime_seconds=round(time.perf_counter() - start, 3),
                 )
+
+            # Windows: bind the child to a Job Object *after* spawn (the
+            # POSIX path applies limits pre-exec instead).
+            job_handle = self._apply_windows_job(proc)
+            try:
+                try:
+                    stdout, stderr = proc.communicate(timeout=self.timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    stdout, stderr = proc.communicate()
+                    return ExecutionResult(
+                        success=False,
+                        error=f"Execution timed out after {self.timeout}s",
+                        stderr=(stderr or "")[:50_000],
+                        runtime_seconds=round(time.perf_counter() - start, 3),
+                        details={"timeout": True},
+                    )
+            finally:
+                self._release_windows_job(job_handle)
+
+            runtime = time.perf_counter() - start
+            stdout = stdout or ""
+            stderr = stderr or ""
+            success = proc.returncode == 0
+            err_text = stderr[:50_000] if not success else ""
+            error_type = ""
+            if not success and err_text:
+                m = re.search(r"^(\w+Error|\w+Exception)", err_text, re.MULTILINE)
+                if m:
+                    error_type = m.group(1)
+            return ExecutionResult(
+                success=success,
+                stdout=stdout[:50_000],
+                stderr=stderr[:50_000],
+                output=stdout[:50_000],
+                error=err_text,
+                error_type=error_type,
+                runtime_seconds=round(runtime, 3),
+                details={"returncode": proc.returncode, "known_names": sorted(known_names)},
+            )
 
     def _get_preexec_fn(self):
         """Return a POSIX preexec_fn that sets resource limits, if available.
@@ -189,6 +211,104 @@ class SandboxExecutor:
         # CREATE_NO_WINDOW: don't open a console window
         # BELOW_NORMAL_PRIORITY_CLASS: reduce scheduling priority
         return 0x08000000 | 0x00008000
+
+    def _apply_windows_job(self, proc: subprocess.Popen) -> int | None:
+        """Assign *proc* to a Job Object with memory/CPU limits (Windows only).
+
+        Best effort by design: returns the job handle (to be released by
+        :meth:`_release_windows_job`), or ``None`` when anything about the
+        platform or API call refuses to cooperate — the wall-clock timeout
+        still applies in that case. ``KILL_ON_JOB_CLOSE`` also ties the
+        child's life to this process, so no orphan survives a crash.
+        """
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    (name, ctypes.c_uint64)
+                    for name in (
+                        "ReadOperationCount",
+                        "WriteOperationCount",
+                        "OtherOperationCount",
+                        "ReadTransferCount",
+                        "WriteTransferCount",
+                        "OtherTransferCount",
+                    )
+                ]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            JobObjectExtendedLimitInformation = 9
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x0100
+            JOB_OBJECT_LIMIT_JOB_TIME = 0x0200
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return None
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = (
+                JOB_OBJECT_LIMIT_PROCESS_MEMORY
+                | JOB_OBJECT_LIMIT_JOB_TIME
+                | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            )
+            info.ProcessMemoryLimit = self.memory_mb * 1024 * 1024
+            # Job user CPU time is expressed in 100ns units.
+            info.BasicLimitInformation.PerJobUserTimeLimit = int(self.timeout) * 10_000_000
+            if not kernel32.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
+            ):
+                kernel32.CloseHandle(job)
+                return None
+            if not kernel32.AssignProcessToJobObject(job, int(proc._handle)):
+                kernel32.CloseHandle(job)
+                return None
+            return job
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Windows Job Object unavailable: %s", e)
+            return None
+
+    def _release_windows_job(self, job_handle: int | None) -> None:
+        """Close the Job Object handle once the child has been reaped.
+
+        Closing is what triggers ``KILL_ON_JOB_CLOSE``; by the time this runs
+        the child has exited or been killed, so the job object is empty.
+        """
+        if not job_handle:
+            return
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(job_handle)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Could not close job handle: %s", e)
 
     def validate_snippet(self, code: str, known_names: set[str]) -> ExecutionResult:
         """Quickly run a snippet to see if it raises a NameError for unknown symbols."""

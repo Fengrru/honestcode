@@ -8,7 +8,7 @@ import pytest
 
 from honestcode.mcp import tools as tools_mod
 from honestcode.mcp.tools import index_project, scan_file, verify_file
-from honestcode.verify.evidence import CONFIDENCE_DETERMINISTIC, CONFIDENCE_HIGH
+from honestcode.verify.evidence import CONFIDENCE_DETERMINISTIC
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -127,17 +127,30 @@ def test_unresolved_base_stays_quiet(project: Path):
     assert _finding(project, code) is None
 
 
-def test_high_confidence_typo_with_unresolved_base(project: Path):
-    """A near-miss typo is still reported even when a base is unresolved."""
+def test_near_miss_typo_with_unresolved_base_stays_quiet(project: Path):
+    """An unresolved base may legitimately provide the member, so even a
+    near-miss must not be reported.
+
+    This used to be reported with ``confidence: high`` — real-world testing
+    showed that is where most false positives came from: classes inheriting
+    stdlib ABCs (``MutableMapping.items``, ``CookieJar.set_policy``) were
+    flagged with a misleadingly confident ``did_you_mean``.
+    """
     code = (
         "class Proxy(UnknownBase):\n"
         "    def refresh(self):\n        return 'r'\n"
         "    def go(self):\n        self.refres()\n"
     )
-    finding = _finding(project, code)
+    assert _finding(project, code) is None
+
+
+def test_near_miss_typo_on_complete_surface_is_reported(project: Path):
+    """Without unresolved bases the same typo is still caught, deterministically."""
+    code = "class Client:\n    def refresh(self):\n        return 'r'\n"
+    finding = _finding(project, code + "\ndef go(client: Client):\n    client.refres()\n")
     assert finding is not None
     assert finding["kind"] == "invented_api"
-    assert finding["confidence"] == CONFIDENCE_HIGH
+    assert finding["confidence"] == CONFIDENCE_DETERMINISTIC
 
 
 def test_scan_file_legacy_shape(project: Path):

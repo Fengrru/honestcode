@@ -1,0 +1,10 @@
+{
+  "name": "dep_alias_and_pypi_name",
+  "description": "Dependency grounding through an aliased submodule (from fakelib import inner; inner.tool()) and a PyPI-named requirement (PyYAML grounds yaml.safe_load); the invented inner.toll() must be caught and the valid calls must stay silent.",
+  "target_file": "app/main.py",
+  "expected_issue_kind": "invented_api",
+  "expected_symbol": "toll",
+  "reset_deps": true,
+  "path_project_root": true,
+  "load_deps": true
+}

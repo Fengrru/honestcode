@@ -7,9 +7,13 @@ current tree, so graph queries (``explore_call_graph``, ``find_dead_code``,
 ``impact``, ``affected``) read from disk instead of re-parsing the project on
 every call.
 
-The same database hosts a FTS5 virtual table over file contents. ``search_code``
-uses it to shrink a regex scan to a *superset* of candidate files, keeping
-results identical to a full scan while touching far fewer files on large repos.
+The same database hosts a FTS5 virtual table (trigram tokenizer) over file
+contents. ``search_code`` uses it to shrink a regex scan to a *superset* of
+candidate files: it extracts a literal substring the pattern requires and
+matches it as a substring, so even matches inside longer tokens are found —
+a plain token-prefix index would have missed those. When no required literal
+can be derived (or FTS5 is unavailable), the caller falls back to a full scan,
+keeping results identical to an unindexed search in all cases.
 """
 
 from __future__ import annotations
@@ -17,7 +21,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -185,7 +188,7 @@ class GraphCache:
             conn.execute("DROP TABLE IF EXISTS fts_files")
             conn.execute(
                 "CREATE VIRTUAL TABLE fts_files USING fts5("
-                "path UNINDEXED, content, tokenize='unicode61')"
+                "path UNINDEXED, content, tokenize='trigram')"
             )
         except sqlite3.Error:
             logger.debug("FTS5 unavailable; search_code will fall back to regex scans")
@@ -199,31 +202,64 @@ class GraphCache:
             conn.execute("INSERT INTO fts_files (path, content) VALUES (?, ?)", (rel, content))
         conn.commit()
 
-    def search_candidate_files(self, pattern: str) -> list[str] | None:
-        """Return files that *may* match ``pattern`` using FTS5 prefix queries.
+    @staticmethod
+    def _required_literal(pattern: str) -> str | None:
+        """Return a literal substring every match of *pattern* must contain.
 
-        The candidate set is a superset of what a plain regex scan can match
-        (token prefix queries such as ``foo*`` also find ``foobar``), so callers
-        get identical results while scanning far fewer files.
+        Conservative by design: a maximal ``[A-Za-z0-9_]+`` run counts only
+        when both neighbours are plain literal characters (alphanumeric,
+        underscore, space, or a string boundary). Anything else — a quantifier
+        after the run (``foo*`` can match ``fo``), an alternation, an escaped
+        metachar before it — disqualifies the run, because guessing wrong here
+        would silently drop real matches.
 
-        Returns ``None`` when FTS5 is unavailable (fall back to a full scan),
-        or an empty list when nothing can match (short-circuit to no results).
+        Returns ``None`` when no run of >= 3 characters qualifies (the trigram
+        index cannot help below three characters).
         """
-        tokens = [t for t in re.findall(r"\w+", pattern) if t]
-        if not tokens:
+        literal_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ ")
+        best = ""
+        n = len(pattern)
+        i = 0
+        while i < n:
+            if pattern[i] not in literal_chars or pattern[i] == " ":
+                i += 1
+                continue
+            j = i
+            while j < n and pattern[j] in literal_chars and pattern[j] != " ":
+                j += 1
+            before_ok = i == 0 or pattern[i - 1] in (" ",)
+            after_ok = j == n or pattern[j] in (" ",)
+            if before_ok and after_ok and (j - i) > len(best):
+                best = pattern[i:j]
+            i = j
+        return best if len(best) >= 3 else None
+
+    def search_candidate_files(self, pattern: str) -> list[str] | None:
+        """Return files that *may* match ``pattern`` using FTS5 substring search.
+
+        Uses the trigram index to find files containing the literal substring
+        that :meth:`_required_literal` proved the pattern requires. Because the
+        match is substring-based (not token-prefix), occurrences inside longer
+        tokens are still found and the candidate set is a true superset; when
+        no required literal can be derived, ``None`` tells the caller to fall
+        back to a full scan. Returns an empty list when the required literal
+        occurs nowhere (short-circuit to no results).
+        """
+        literal = self._required_literal(pattern)
+        if literal is None:
             return None
         try:
             conn = sqlite3.connect(str(self.path))
             try:
                 cur = conn.cursor()
-                seen: set[str] = set()
-                for tok in tokens:
-                    for (path,) in cur.execute(
-                        "SELECT path FROM fts_files WHERE fts_files MATCH ?", (tok + "*",)
-                    ):
-                        seen.add(path)
+                paths: list[str] = []
+                for (path,) in cur.execute(
+                    "SELECT path FROM fts_files WHERE fts_files MATCH ?",
+                    (f'"{literal}"',),
+                ):
+                    paths.append(path)
             finally:
                 conn.close()
         except sqlite3.Error:
             return None
-        return sorted(seen)
+        return sorted(set(paths))
