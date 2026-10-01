@@ -57,7 +57,7 @@ dev = [
     "pre-commit>=3.0",
 ]
 multi-language = [
-    "tree-sitter>=0.21,<0.26",
+    "tree-sitter>=0.21,<0.27",
     "tree-sitter-javascript>=0.21",
     "tree-sitter-typescript>=0.21",
     "tree-sitter-go>=0.21",
