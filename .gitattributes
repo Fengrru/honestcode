@@ -1,0 +1,38 @@
+# Normalize line endings in the repository, and declare the encoding policy
+# where git itself reads it.
+#
+# Why: a sibling repository lost 46 files to a code-page round trip that
+# replaced the final byte of 3-byte UTF-8 sequences with `?`. Nothing caught it,
+# because the files still parsed and the tests still passed. `.editorconfig`
+# tells an editor what to write; this tells git what to store and check out.
+#
+# `text=auto` normalizes to LF in the repository on commit, so a Windows
+# checkout with core.autocrlf=true cannot leak CRLF into the history.
+
+* text=auto eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+*.ts text eol=lf
+*.js text eol=lf
+
+# The vendored psf/requests snapshot is compared byte-for-byte by the
+# real-world false-positive benchmark, so it must survive a checkout unchanged.
+benchmarks/realworld_fp/vendor/** -text
+
+# Binary fixtures, if any are added, must not be normalized.
+*.png binary
+*.jpg binary
+*.gif binary
+*.whl binary
+*.gz binary
+*.zip binary
+
+.gitattributes text eol=lf
+.editorconfig text eol=lf

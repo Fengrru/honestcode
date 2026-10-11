@@ -1,0 +1,31 @@
+# No editor may save these files in anything but UTF-8.
+#
+# Why: a sibling repository lost 46 files to a code-page round trip that
+# replaced the final byte of 3-byte UTF-8 sequences with `?` and ate the
+# following space. Nothing in CI noticed — the files still parsed, the tests
+# still passed, and only a strict reader or a browser showed the damage. A
+# repository that declares its line endings but not its encoding leaves that
+# door open on a Windows workstation.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.md]
+# Trailing whitespace is a line break in Markdown.
+trim_trailing_whitespace = false
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.{ts,js,mjs,cjs}]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
