@@ -56,6 +56,14 @@ dev = [
     "ruff>=0.6",
     "pre-commit>=3.0",
 ]
+pydantic-ai = [
+    "pydantic-ai-slim>=2.55",
+    # pydantic-ai-slim depends on `mcp` with no upper bound, so a fresh install
+    # of this extra alone resolves mcp to 2.x — where FastMCP was renamed and
+    # honestcode's own MCP server stops importing. Pinned here so the extra
+    # cannot break the core package it is installed alongside.
+    "mcp>=1.6.0,<2.0",
+]
 multi-language = [
     "tree-sitter>=0.21,<0.26",
     "tree-sitter-javascript>=0.21",

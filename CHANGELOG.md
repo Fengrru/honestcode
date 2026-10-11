@@ -7,6 +7,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `SideEffectGuard.recovered_retry`: the step after a recovery review
+
+`recover()` yields decisions and `resolve()` records what an operator found, but
+nothing carried the effect through afterwards. `recovered_retry(effect_id, …)`
+closes that gap, and refuses the two cases that must never be papered over:
+
+* a `committed` effect is served from its record rather than re-run;
+* an `executing` one raises, because an unresolved outcome is exactly what must
+  not be retried blind — it may already have reached the outside world.
+
+`approve_irreversible` defaults to True here, unlike `run`. Deliberate and
+narrow: the method requires an `effect_id`, which only comes from a recovery
+review, so the approval already happened in the real world.
+
+### Fixed — pydantic-ai extra could break the core package it installs alongside
+
+`pydantic-ai-slim` depends on `mcp` with no upper bound, so a fresh install of
+the extra resolved `mcp` to 2.x, where `FastMCP` was renamed — and
+`honestcode`'s own MCP server stopped importing. The extra now pins `mcp<2`.
+
+### Fixed — read-only tools were refused, and redirections were unguarded
+
+Two failures in the pydantic-ai integration's classification, both found by
+running it rather than by reading it:
+
+* A tool whose name the shared table did not recognise fell to the conservative
+  default (irreversible) and was then refused, so a local file read cost an
+  approval. `ChargePolicy.read_only_tools` lets an application declare its own
+  reads; the generic names are recognised without declaring anything.
+* Redirect detection was missing entirely, so `echo x > f` matched the
+  read-only table and was treated as a read — a write that was not guarded.
+
+### Added — pydantic-ai integration: durable idempotency for agent tool calls
+
+`honestcode/integrations/pydantic_ai.py` wraps tool execution through the
+framework's `wrap_tool_execute` capability hook, so an effect that already
+reached the outside world is not carried out a second time — including across a
+crash and restart, which is the case the framework cannot cover by itself.
+`pydantic-ai` already offers in-process deferral (`CallDeferred`,
+`ApprovalRequired`); this is for the different question, *did the outside world
+already change and I no longer remember*, which survives the process.
+
+The hook works because returning from `wrap_tool_execute` without calling
+`handler()` skips execution entirely and the substitute value becomes the tool
+result. Verified against `pydantic-ai` 2.55.0 before anything was built on it.
+
+**Verified against a real model.** A DeepSeek session charged a card, the
+process was killed with the record left `executing`, and a fresh process resumed
+under the same run id. The vendor ledger shows **one** charge, and the model
+replied that it could not confirm the charge so it would not claim success —
+which is the behaviour the receipt text exists to produce.
+
+Three things came out of building it that are worth recording:
+
+1. **A guard that silently never ran.** `ToolCallPart.args` is a dict by type
+   but a JSON string in practice for every real provider. The first version
+   treated that as unkeyable and let the call through — so the guard reported
+   nothing and protected nothing, on every real call. String args are now
+   parsed, and the branch that still cannot key a call records it in
+   `unguarded_calls` rather than passing silently.
+2. **Session-scoped keys cannot dedupe a restart**, because a restart is
+   precisely a new session id. See the `scope` entry below.
+3. **Tool classification has to be declared, not guessed.** The shared
+   classifier cannot tell a local read from an unknown external call, and
+   defaults what it cannot classify to irreversible — so a `read_file`-shaped
+   tool is refused until the application declares it pure. That is the safe
+   direction, and it is now pinned by a test rather than left implicit.
+
+### Changed — `scope` is the durability boundary, and it is authoritative
+
+`SideEffectGuard.run` and the new `arun` accept `scope=`, built with the new
+`durable_scope(run_id, *parts)` helper. A scoped effect's identity comes from the
+scope and the effect's own arguments, and **not** from the session — so the same
+scope in a different session resolves to the same record. Without it, a
+crash-and-retry is unrecognisable as a retry and the effect happens twice; that
+was demonstrated before the fix, not assumed. Passing no scope keeps the
+previous session-scoped behaviour.
+
+### Added — `SideEffectGuard.arun`
+
+The async counterpart of `run`, for callers that are already async. The claim is
+written *before* the await, so a process that dies while the tool is in flight
+records an unknown outcome rather than looking unstarted. Needed because `run`
+is synchronous and cannot drive an awaitable on a loop that is already running —
+which is how the first version of the integration failed.
+
+### Added — `honestcode.guards`: crash-safe wrappers for agent side effects
+
+An agent that retries a tool call after a crash can charge a card twice, send a
+message twice, or deploy twice. Durable-execution engines do not solve this —
+Temporal and Restate both guarantee deterministic *replay of orchestration* and
+leave exactly-once external effects to the application. This adds the missing
+piece: classify the effect, key it, persist the key, refuse to run it again.
+
+Ported from `effects.rs` in `nexus-runtime`, where the design was sound and the
+implementation had three defects that are fixed here rather than carried over:
+
+1. **The idempotency key was computed and discarded.** Upstream wrote
+   `let _idempotency_key = ...` and then compared raw `request_hash` values in
+   memory, so the key died with the process — the exact crash after which the
+   agent retries. The key is now derived, persisted, and enforced by a
+   `UNIQUE (session_id, idempotency_key)` constraint, so it works across a
+   restart. This is the whole point of the module.
+2. **Failure was recorded as success.** Upstream set `status = Committed` and
+   *then* checked `if !result.success`, so a throwing executor left a committed
+   record and the next attempt was served a receipt for work that never
+   happened. The order is inverted.
+3. **There was no state between "not started" and "done".** An `EXECUTING`
+   state is committed *before* the outside world is touched, so a process that
+   dies mid-call leaves evidence that the outcome is **unknown** rather than
+   evidence that nothing happened — which is what stops the retry.
+
+Also fixed: the precondition check was `precond == "deny"`, a comparison
+against one magic string, so every other precondition was silently ignored —
+documented protection that did not exist. Preconditions are now callables that
+receive the caller's context and must actually pass.
+
+Two deliberate divergences from upstream's tables:
+
+* **Unknown actions default to irreversible, not idempotent.** An action this
+  code does not recognise is the one you must not silently retry; the upstream
+  default made it retryable.
+* **Target hints use word boundaries.** Upstream's `target.contains("push")`
+  classified `/srv/pushkin/report.txt` as irreversible.
+
+`honestcode/guards/` is written to be extracted into its own distribution:
+stdlib-only, no dependency on HonestCode's finding protocol, and not registered
+as an MCP tool (a guard belongs in the caller's own process, not behind a client
+configuration file). `tests/test_guards.py` enforces the isolation rule with an
+AST import check — and pins that check against a planted violation, because the
+first version of it looked for a *string* in the source and so passed on any
+file that also imported a sibling.
+
+### Added — value-drift benchmark: does formatting-tolerant matching change the wrong value?
+
+`benchmarks/value_drift/` asks whether an agent's edit can land on a region the
+caller never named, when its search string does not pin down a unique location.
+It carries a behaviour-preserving port of the eight matching strategies from
+`fuzzy-patch` **with and without** its value-literal guard, plus a matcher in
+the shape the 2026 ecosystem converged on (similarity floor + uniqueness +
+disproportionate-span rejection), over ten fake episodes in which a near-miss
+sibling differs only in a value literal.
+
+Findings, stated as measured rather than as claimed:
+
+* The guarded cascade lands on the region the caller named in **10 of 10**
+  scenarios; the crude similarity matcher **refuses 9 of 10**. Refusal is how a
+  conservative matcher avoids drift, so this is a real difference in
+  edit-application reliability.
+* The value guard **changes no outcome on this corpus**, and the reason is
+  structural: a region the guard accepts necessarily carries exactly the search
+  string's literal multiset. So whenever the search string carries the value
+  being replaced — as all ten scenarios do — the guard's accept and reject sets
+  are both "regions whose values equal the caller's". Its effect is on recall,
+  not precision: it refuses a match when the search string's literals match no
+  region at all, converting a would-be drift into a safe `no_match`.
+* An earlier draft of the corpus made this concrete. Scenarios that quoted a
+  nested block without its structural keys were rejected by the guard **on the
+  intended region itself**, because the literal counts differed — the guard
+  behaving as designed, and the reason the benchmark cannot exhibit a drift case
+  for it.
+
+`tests/test_value_drift.py` asserts the corpus invariants, pins the ported
+matcher's behaviour, and fails if the guard ever becomes load-bearing — so the
+conclusion above has to be rewritten rather than quietly invalidated. Wired into
+CI as the `benchmark-value-drift` job, which exits non-zero if the guarded
+matcher drifts outside the caller's region.
+
 ### Fixed — a project without a marker file reported correct imports as undefined
 
 `scan_file` grounds a file against a fresh index of its own project. When no
