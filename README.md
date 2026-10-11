@@ -262,6 +262,49 @@ See the old tool reference below for the complete list.
 
 ---
 
+## Crash-safe side effects
+
+`verify_file` checks code before it runs. `guards/` covers what happens after:
+an agent that retries a tool call can charge a card twice, and no durable
+execution engine prevents it — Temporal and Restate both guarantee deterministic
+replay of *orchestration* and leave exactly-once external effects to the
+application.
+
+```python
+from honestcode.guards import EffectStore, SideEffectGuard, durable_scope
+
+guard = SideEffectGuard(session_id="run-42", store_path=".agent/effects.db")
+
+outcome = guard.run(
+    "charge",
+    target="cus_123",
+    payload={"cents": 4200},
+    execute=lambda: charge_card("cus_123", 4200),
+    approve_irreversible=True,
+    scope=durable_scope("order-4711", "charge", "cus_123"),
+)
+
+outcome.executed     # False on the retry — a receipt, not a second charge
+outcome.effect_id    # stable across a restart, because the key is on disk
+```
+
+The interesting part is what `scope` does. Pass it and the effect's identity
+comes from the scope rather than the session — which is the difference between a
+retry being recognised and a customer being charged twice, because a restart *is*
+a new session id. Pass nothing and the guard stays session-scoped.
+
+Refusing is the default direction: an unrecognised action is treated as
+irreversible rather than idempotent, and irreversible effects need explicit
+approval. A run that dies between the call and the record leaves the effect
+`executing`, and the next attempt reports the outcome as unknown instead of
+guessing — which is what stops the retry.
+
+For a framework, `integrations/` binds the guard to pydantic-ai, where a
+committed effect replaces the tool result instead of re-running the tool. See
+[`honestcode/integrations/README.md`](honestcode/integrations/README.md).
+
+---
+
 ## Benchmark
 
 HonestCode includes three benchmark suites that run automatically in CI on every
@@ -356,11 +399,25 @@ honestcode/
 ├── graph/         # Persistent call graph (SQLite)
 ├── structure/     # AST extraction
 ├── sandbox/       # Sandboxed execution
+├── guards/        # Crash-safe side effects (stdlib-only, extractable)
+├── integrations/  # Framework bindings — pydantic-ai today
 └── cli.py         # Command-line interface
 ```
 
 `verify_file` is the agent interface. `scan_file` is the default MCP tool and
 returns both the new evidence shape and the legacy `issues` list.
+
+Two of those directories answer a different question from the rest. Everything
+above `guards/` asks *is this code consistent with the repository*. `guards/`
+asks *did this effect already happen* — an agent that retries a tool call after
+a crash can charge a card twice, and durable-execution engines leave exactly-once
+external effects to the application. `integrations/` binds the guard to a
+framework; pydantic-ai's `wrap_tool_execute` is the first, and a tool result is
+replaced rather than re-run when the effect has already been committed.
+
+`guards/` is deliberately stdlib-only and does not depend on this package's
+protocols, so it can be extracted into its own distribution. `tests/test_guards.py`
+enforces that with an AST import check.
 
 ---
 
@@ -370,6 +427,12 @@ returns both the new evidence shape and the legacy `issues` list.
 - symbol / API / function / class / method / import / call verification
 - invented API detection with structured evidence
 - auto-index on `scan_file`
+
+### Beyond the roadmap — crash-safe side effects (now)
+Not a verification layer, so it has no place in the v0.2/v0.3 sequence below:
+`guards/` makes an effect idempotent across a crash, and `integrations/` binds
+it to pydantic-ai. It answers "did this already happen", which is a runtime
+question rather than a static one.
 
 ### v0.2 — Semantic contract verification
 - function expects `UserID`, agent passes `User` → suspicious
