@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from honestcode.mcp import tools as tools_mod
 from honestcode.mcp.tools import index_project, scan_file
 
 if TYPE_CHECKING:
@@ -170,3 +171,91 @@ def test_undefined_call_still_detected(project: Path):
     code = "totally_made_up_function_xyz()\n"
     issues = _scan(project, code)
     assert any(i["name"] == "totally_made_up_function_xyz" for i in issues)
+
+
+# ── Auto-discovery without a project marker ───────────────────────────────
+# With no marker the index falls back to the verified file's package root.
+# Indexing only the file's immediate directory hid sibling packages and reported
+# correct cross-package imports as undefined symbols — a false positive that
+# sends the agent to "fix" working code.
+
+
+def _no_marker_project(tmp_path: Path) -> Path:
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "lib" / "http.py").write_text(
+        "class Connection:\n    def execute(self, sql):\n        return None\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "cases").mkdir()
+    (tmp_path / "cases" / "__init__.py").write_text("", encoding="utf-8")
+    return tmp_path
+
+
+def _scan_in(tmp_path: Path, subdir: str, code: str) -> list[dict]:
+    """Scan *code* from inside *subdir*, with no explicit index and no marker."""
+    f = tmp_path / subdir / "snippet.py"
+    f.write_text(code, encoding="utf-8")
+    res = scan_file(str(f))
+    assert res["success"], f"scan failed: {res.get('error')}"
+    return res["issues"]
+
+
+def _clear_index_state(monkeypatch) -> None:
+    monkeypatch.setattr(tools_mod, "_project_index", None)
+    monkeypatch.setattr(tools_mod, "_project_root", None)
+    monkeypatch.setattr(tools_mod, "_index_by_root", {})
+
+
+def test_cross_package_import_resolves_without_marker(tmp_path: Path, monkeypatch):
+    """A sibling package stays importable when the project has no marker file."""
+    _clear_index_state(monkeypatch)
+    project = _no_marker_project(tmp_path)
+
+    code = (
+        "from lib.http import Connection as Conn\ndef f():\n    return Conn().execute('select 1')\n"
+    )
+    issues = _scan_in(project, "cases", code)
+    assert issues == [], f"False positives without a marker: {issues}"
+
+
+def test_invented_api_still_detected_without_marker(tmp_path: Path, monkeypatch):
+    """Widening the scope must not silence detection inside it."""
+    _clear_index_state(monkeypatch)
+    project = _no_marker_project(tmp_path)
+
+    code = "from lib.http import Connection\ndef f():\n    return Connection().missing_method()\n"
+    issues = _scan_in(project, "cases", code)
+    assert any(i["name"] == "missing_method" for i in issues), issues
+
+
+def test_package_root_walks_out_of_packages(tmp_path: Path):
+    """The import root is the first ancestor that is not itself a package."""
+    pkg = tmp_path / "outer" / "inner"
+    pkg.mkdir(parents=True)
+    (tmp_path / "outer" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+    assert tools_mod._package_root(pkg) == tmp_path
+
+    # A directory that is not a package is already an import root.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert tools_mod._package_root(plain) == plain
+
+
+def test_package_root_refuses_filesystem_root():
+    """Never adopt a drive root as the project root."""
+    from pathlib import Path as _Path
+
+    anchor = _Path(_Path.cwd().anchor)
+    assert tools_mod._package_root(anchor) is None
+
+
+def test_undefined_import_still_detected_without_marker(tmp_path: Path, monkeypatch):
+    """A name the sibling module really does not define is still reported."""
+    _clear_index_state(monkeypatch)
+    project = _no_marker_project(tmp_path)
+
+    issues = _scan_in(project, "cases", "from lib.http import NoSuchThing\nNoSuchThing()\n")
+    assert any(i["name"] == "NoSuchThing" for i in issues), issues

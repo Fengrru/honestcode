@@ -76,6 +76,10 @@ _AUTO_INDEX_ENABLED = os.environ.get("HONESTCODE_AUTO_INDEX", "1").lower() not i
 }
 _PROJECT_MARKERS = (".honestcode", ".git", "pyproject.toml", "setup.py", "requirements.txt")
 
+# How many package levels above the verified file may be adopted as the import
+# root when no project marker exists.
+_MAX_PACKAGE_WALK = 4
+
 
 def _find_project_root(start: Path) -> Path | None:
     """Walk upward from *start* looking for a project marker."""
@@ -89,6 +93,28 @@ def _find_project_root(start: Path) -> Path | None:
         if any((candidate / m).exists() for m in _PROJECT_MARKERS):
             return candidate
     return None
+
+
+def _package_root(start: Path) -> Path | None:
+    """Return the import root for a directory, walking out of packages.
+
+    Python treats the first ancestor without an ``__init__.py`` as the import
+    root. Walking out to it keeps sibling packages inside the indexed scope —
+    indexing only the verified file's own directory hid them and reported
+    correct cross-package imports as undefined symbols.
+
+    The walk is bounded: a project root that is itself a package would otherwise
+    let the search climb into a shared directory (a temp or home folder) and
+    index unrelated trees.
+    """
+    current = start.resolve()
+    for _ in range(_MAX_PACKAGE_WALK):
+        if not (current / "__init__.py").exists():
+            break
+        current = current.parent
+    if current == current.parent:  # filesystem root — never index an entire drive
+        return None
+    return current
 
 
 # Per-root index memo so scanning files from two projects in one session never
@@ -126,14 +152,12 @@ def _index_for_file(path: Path) -> ProjectIndex | None:
     if root is None:
         root = _find_project_root(path)
     if root is None:
-        # No marker anywhere: index the file's own directory. Agents work in
+        # No marker anywhere: index from the file's package root. Agents work in
         # scratch/workspace directories all the time; giving up here made
-        # verify_file silently return "pass" for broken code. Skip filesystem
-        # roots so we never try to index an entire drive.
-        parent = resolved.parent
-        if parent == parent.parent:
+        # verify_file silently return "pass" for broken code.
+        root = _package_root(resolved.parent)
+        if root is None:
             return None
-        root = parent
 
     fresh = get_project_index(root, force_rebuild=False)
     with _state_lock:
