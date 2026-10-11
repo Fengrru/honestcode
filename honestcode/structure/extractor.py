@@ -147,6 +147,12 @@ class StructureExtractor:
                 else:
                     imports.add(module.split(".")[0])
                 for alias in child.names:
+                    if alias.name == "*":
+                        # Star imports are keyed by their source module so
+                        # several in one file do not overwrite each other;
+                        # the verifier expands them against the symbol index.
+                        imported_symbols[f"*{module}"] = module
+                        continue
                     asname = alias.asname or alias.name
                     imported_symbols[asname] = f"{module}.{alias.name}" if module else alias.name
             elif isinstance(child, ast.Assign) and not in_function:

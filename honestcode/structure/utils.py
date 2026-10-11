@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import importlib.util
 import sys
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -11,7 +12,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pathlib import Path
 
-__all__ = ["call_name", "call_base", "module_name_for", "stdlib_roots", "stdlib_resolves"]
+__all__ = [
+    "call_base",
+    "call_name",
+    "importable_root",
+    "module_name_for",
+    "stdlib_resolves",
+    "stdlib_roots",
+]
 
 
 @lru_cache(maxsize=1)
@@ -70,6 +78,27 @@ def stdlib_resolves(dotted: str) -> bool | None:
         except Exception:  # noqa: BLE001 - property/module hook misbehaving
             return None
     return True
+
+
+@lru_cache(maxsize=2048)
+def importable_root(name: str) -> bool:
+    """Whether the top-level module *name* is importable in this interpreter.
+
+    Used to recognise an undeclared third-party import root as real code: the
+    package exists in the environment even though no manifest declares it
+    (``from requests import get`` in a project whose ``requirements.txt`` only
+    lists pyyaml is an undeclared dependency, not a hallucination). Only the
+    top-level name is ever probed, and ``find_spec`` does not execute the
+    module — parent packages are not imported either.
+    """
+    if not name or not name.isidentifier():
+        return False
+    if name in stdlib_roots():
+        return True
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError, AttributeError, TypeError, OSError):
+        return False
 
 
 def call_name(node: ast.expr) -> str | None:

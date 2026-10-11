@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 from honestcode.structure.extractor import StructureExtractor
 from honestcode.structure.utils import (
     call_name,
+    importable_root,
     module_name_for,
     stdlib_resolves,
     stdlib_roots,
@@ -54,11 +55,61 @@ from honestcode.verify.surface import (
 if TYPE_CHECKING:
     from honestcode.honest.symbol_index import ProjectIndex
 
-__all__ = ["SurfaceStore", "verify_tree", "verify_file_source", "valid_imported_names"]
+__all__ = [
+    "SurfaceStore",
+    "star_imports_unresolved",
+    "valid_imported_names",
+    "verify_file_source",
+    "verify_tree",
+]
 
 MAX_EVIDENCE_METHODS = 8
 _NEAR_MISS_CUTOFF = 0.6
 _MAX_BASE_DEPTH = 5
+
+
+def _star_names(
+    module: str, index: ProjectIndex | None, seen: frozenset[str], depth: int = 0
+) -> set[str] | None:
+    """Public names ``from <module> import *`` binds, or ``None`` when the
+    source's export surface cannot be fully enumerated.
+
+    ``None`` (not the empty set) is the load-bearing distinction: it means
+    absence cannot be proven, so callers must stay silent instead of
+    reporting. A module-level ``__getattr__`` (PEP 562) or a star of its own
+    makes the surface open; re-exported stars are expanded transitively with a
+    depth/cycle guard.
+    """
+    if index is None or not module or depth > 4 or module in seen:
+        return None
+    names = index.module_symbols.get(module)
+    if names is None or "__getattr__" in names:
+        return None
+    out: set[str] = set()
+    seen = seen | {module}
+    for name in names:
+        if name.startswith("*"):
+            sub = _star_names(name[1:], index, seen, depth + 1)
+            if sub is None:
+                return None
+            out |= sub
+        elif not name.startswith("_"):
+            out.add(name)
+    return out
+
+
+def star_imports_unresolved(imported_symbols: dict[str, str], index: ProjectIndex | None) -> bool:
+    """True when any star import's source cannot be enumerated.
+
+    An unenumerable ``from X import *`` may have bound any name, so bare calls
+    that nothing else grounds must not be reported as undefined in such files.
+    """
+    for key, module in imported_symbols.items():
+        if not key.startswith("*"):
+            continue
+        if _star_names(module, index, frozenset()) is None:
+            return True
+    return False
 
 
 def valid_imported_names(
@@ -86,6 +137,12 @@ def valid_imported_names(
     Third-party roots are trusted wholesale when they were merely declared
     (they may not be installed, so the name cannot be checked) — *dep_roots*
     supplies those root names; when omitted they are derived from *dep_names*.
+    An undeclared root that is nevertheless importable in this environment
+    (``from requests import get`` with no manifest entry) is real code too:
+    the import is an undeclared dependency, not a hallucination, so its local
+    name is kept. Star imports are expanded against the index (see
+    :func:`_star_names`); callers can use :func:`star_imports_unresolved` to
+    stay silent when an expansion is impossible.
     """
     valid: set[str] = set()
     roots = dep_roots if dep_roots is not None else {n.split(".", 1)[0] for n in dep_names}
@@ -107,6 +164,11 @@ def valid_imported_names(
             project_modules.add(".".join(parts[:i]))
 
     for local_name, source_name in imported_symbols.items():
+        if local_name.startswith("*"):
+            expanded = _star_names(imported_symbols[local_name], index, frozenset())
+            if expanded is not None:
+                valid |= expanded
+            continue
         if not source_name:
             valid.add(local_name)
             continue
@@ -142,6 +204,14 @@ def valid_imported_names(
             # ``from lib.api import does_not_exist`` keeps ``lib`` bound but
             # rejects the invented local name.
             valid.add(root)
+            continue
+        if importable_root(root):
+            # Installed in this environment, merely undeclared. The import is
+            # real code — an undeclared dependency, not a hallucination.
+            # Project roots were handled above, so a broken import from a
+            # shadowed project module cannot slip through here.
+            valid.add(root)
+            valid.add(local_name)
 
     return valid
 
@@ -228,6 +298,7 @@ class SurfaceStore:
         self.local_functions = local_functions or {}
         self._imported: dict[Path, dict[str, str]] = {}
         self._resolvers: dict[Path, NameResolver] = {}
+        self._base_short_names: set[str] | None = None
 
     def _facts_for(
         self, path: Path
@@ -304,7 +375,15 @@ class SurfaceStore:
 
         members = set(surface.members)
         methods = dict(surface.methods)
-        complete = True
+        # A surface is complete only when nothing outside it can contribute
+        # members: every syntactic base was resolvable, no metaclass (which may
+        # inject arbitrary members) and no class decorator (``@attr.s``-style
+        # decorators add methods) was applied. ``decorated`` used to be
+        # recorded and never read, so ``@add_methods class Foo`` reported
+        # ``Foo.injected()`` as an invented API.
+        complete = (
+            surface.unknown_bases == 0 and not surface.has_metaclass and not surface.decorated
+        )
         for base in surface.bases:
             if not base or base in EMPTY_BASES:
                 continue
@@ -331,6 +410,30 @@ class SurfaceStore:
         # Imported symbols come from the shared parse cache — this used to
         # re-parse the whole file on every base-class lookup.
         return self.resolver_for(path, self.imported_for(path))
+
+    def may_be_subclassed(self, qname: str) -> bool:
+        """Whether any known class lists this class's short name as a base.
+
+        A mixin component (PyYAML's ``Scanner``, composed as ``class
+        Loader(Reader, Scanner, Parser, ...)``) calls members it does not
+        define; the member that grounds such a call lives in a sibling
+        component. The check is name-based on purpose: resolving every base in
+        the project would cost more than the answer is worth, and a short-name
+        collision only ever makes the verifier quieter, never louder.
+        """
+        if self._base_short_names is None:
+            names: set[str] = set()
+            for surface in self.local_classes.values():
+                names.update(b.rsplit(".", 1)[-1] for b in surface.bases)
+            if self.index is not None:
+                for qname_, info in self.index.symbols.items():
+                    if info.kind != "class":
+                        continue
+                    surface = self.class_surface(qname_)
+                    if surface is not None:
+                        names.update(b.rsplit(".", 1)[-1] for b in surface.bases)
+            self._base_short_names = names
+        return qname.rsplit(".", 1)[-1] in self._base_short_names
 
 
 # ── Scope tracking ──────────────────────────────────────────────────────
@@ -369,22 +472,53 @@ class _Scope:
         self.stack: list[dict[str, str]] = [{}]
         self.class_qname: str | None = None
         self.class_stack: list[str | None] = [None]
+        self.self_params: list[str | None] = [None]
 
-    def push(self, bindings: dict[str, str], class_qname: str | None = None) -> None:
+    def push(
+        self,
+        bindings: dict[str, str],
+        class_qname: str | None = None,
+        self_param: str | None = None,
+    ) -> None:
         self.stack.append(bindings)
         self.class_stack.append(class_qname)
+        self.self_params.append(self_param)
         self.class_qname = class_qname
 
     def pop(self) -> None:
         self.stack.pop()
         self.class_stack.pop()
+        self.self_params.pop()
         self.class_qname = self.class_stack[-1]
+
+    @property
+    def self_param(self) -> str | None:
+        """First parameter name of the current function frame, if any."""
+        return self.self_params[-1]
 
     def lookup(self, name: str) -> str | None:
         for frame in reversed(self.stack):
             if name in frame:
                 return frame[name]
         return None
+
+
+def _first_param_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """Name of the first parameter (the ``self``/``cls`` slot), or ``None``.
+
+    ``None`` for static methods (no bound first argument) and for functions
+    with no positional parameters. Inside such a frame, a name that happens to
+    read ``self`` or ``cls`` is an ordinary variable — ``cls`` in
+    ``_ClassBuilder.__init__(self, cls, ...)`` is the class *being built*, and
+    resolving it to the enclosing class reported ``cls.__attrs_init_subclass__()``
+    as an invented API on attrs' own class builder.
+    """
+    for decorator in node.decorator_list:
+        name = call_name(decorator)
+        if name and name.split(".")[-1] == "staticmethod":
+            return None
+    pos = [*getattr(node.args, "posonlyargs", []), *node.args.args]
+    return pos[0].arg if pos else None
 
 
 # ── The verifier ────────────────────────────────────────────────────────
@@ -400,6 +534,9 @@ class _Verifier:
     module: str
     dep_roots: set[str] | None = None
     dep_enumerated: set[str] | None = None
+    # Set when the file has a star import whose source cannot be enumerated;
+    # unproven bare calls must then stay silent (see star_imports_unresolved).
+    star_open: bool = False
     findings: list[Finding] = field(default_factory=list)
     checked: int = 0
     _dep_roots: set[str] = field(init=False)
@@ -437,7 +574,11 @@ class _Verifier:
     def _walk(self, node: ast.AST, scope: _Scope) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                scope.push(_bindings_of(child, is_function=True), scope.class_qname)
+                scope.push(
+                    _bindings_of(child, is_function=True),
+                    scope.class_qname,
+                    _first_param_name(child),
+                )
                 self._walk(child, scope)
                 scope.pop()
             elif isinstance(child, ast.ClassDef):
@@ -469,7 +610,9 @@ class _Verifier:
             next_type = surface.instance_attrs.get(attr)
             if next_type is None and attr in surface.attributes:
                 return None  # class attr without type info — cannot continue
-            if next_type is None:
+            if not next_type:
+                # Known instance attribute with an unknown type
+                # (``self.x = <expr>``) — the chain cannot continue.
                 return None
             qname = self.resolver.resolve_dotted(next_type)
             if qname is None:
@@ -492,17 +635,18 @@ class _Verifier:
         if not receiver:
             self._check_bare_call(call, name)
             return
-        if (
-            receiver.startswith("self.")
-            or receiver.startswith("cls.")
-            or receiver in ("self", "cls")
-        ):
-            if scope.class_qname is None:
-                return
+        first = scope.self_param
+        is_bound_receiver = first is not None and (
+            receiver == first or receiver.startswith(f"{first}.")
+        )
+        if is_bound_receiver and scope.class_qname is not None:
             qname = self._resolve_self_chain(receiver, scope.class_qname)
             if qname is None:
                 return
-            self._check_member_call(call, qname, attr)
+            # Only a direct ``self``/``cls`` receiver needs the mixin gate;
+            # ``self.client.x()`` resolves to a concrete class like any
+            # annotated receiver.
+            self._check_member_call(call, qname, attr, via_self=receiver == first)
             return
         # A dependency module alias (`pd.read_excel`) is checked against the
         # loaded dependency API index.
@@ -544,6 +688,10 @@ class _Verifier:
     def _check_bare_call(self, call: ast.Call, name: str) -> None:
         base = name.split(".")[0]
         if base not in self.defined and name not in self.defined:
+            if self.star_open:
+                # A star import whose source could not be enumerated may have
+                # bound this name — absence cannot be proven, stay silent.
+                return
             self._finding(
                 line=call.lineno,
                 kind=KIND_UNDEFINED_SYMBOL,
@@ -608,7 +756,9 @@ class _Verifier:
         )
         return True
 
-    def _check_member_call(self, call: ast.Call, qname: str, attr: str) -> None:
+    def _check_member_call(
+        self, call: ast.Call, qname: str, attr: str, *, via_self: bool = False
+    ) -> None:
         view = self.store.view(qname)
         if view is None:
             return  # Unknown surface — stay silent rather than guess.
@@ -627,6 +777,13 @@ class _Verifier:
             # findings on real code — e.g. ``CaseInsensitiveDict.items()``,
             # supplied by the unresolvable ``MutableMapping`` base, was
             # reported with ``did_you_mean: lower_items``.
+            return
+
+        if via_self and self.store.may_be_subclassed(qname):
+            # The receiver is ``self``: at runtime it may be an instance of any
+            # subclass, and a class composed elsewhere in the project
+            # (``class Loader(Reader, Scanner, Parser, ...)``) supplies members
+            # this class does not name. Absence cannot be proven — stay silent.
             return
 
         public = self._public(view.members)
@@ -726,13 +883,16 @@ def verify_tree(
     imported_symbols: dict[str, str],
     dep_roots: set[str] | None = None,
     dep_enumerated: set[str] | None = None,
+    star_open: bool = False,
 ) -> tuple[list[Finding], int]:
     """Verify every call site in *tree* and return ``(findings, checked)``.
 
     *dep_roots* optionally supplies trusted dependency root names beyond those
     derivable from *dep_names* (see :func:`valid_imported_names`);
     *dep_enumerated* lists the dependency modules whose member surface is
-    known, which is what makes invented-API reporting sound.
+    known, which is what makes invented-API reporting sound; *star_open* is
+    true when the file star-imports a module whose export surface cannot be
+    enumerated (see :func:`star_imports_unresolved`).
     """
     module = module_name_for(path, root) if root else path.stem
     local_classes, local_functions = extract_file_surfaces(
@@ -751,6 +911,7 @@ def verify_tree(
         dep_names=dep_names,
         dep_roots=dep_roots,
         dep_enumerated=dep_enumerated,
+        star_open=star_open,
         resolver=resolver,
         store=store,
         module=module,

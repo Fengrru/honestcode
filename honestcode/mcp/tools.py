@@ -45,7 +45,7 @@ from honestcode.verify.evidence import (
     build_report,
     render_text,
 )
-from honestcode.verify.verify import valid_imported_names, verify_tree
+from honestcode.verify.verify import star_imports_unresolved, valid_imported_names, verify_tree
 
 __all__ = [
     "index_project",
@@ -269,6 +269,12 @@ def _normalize_imported_symbols(
         if not abs_module:
             continue
         for alias in node.names:
+            if alias.name == "*":
+                # Restate a relative star import as an absolute one: drop the
+                # raw key the extractor wrote, add the resolved source.
+                normalized.pop(f"*{target}", None)
+                normalized[f"*{abs_module}"] = abs_module
+                continue
             local = alias.asname or alias.name
             normalized[local] = f"{abs_module}.{alias.name}"
     return normalized
@@ -1060,6 +1066,9 @@ def scan_file(file_path: str) -> dict:
     module = _module_name(p, Path(idx.root)) if idx is not None else p.stem
     imported_symbols = _normalize_imported_symbols(res.imported_symbols or {}, tree, module)
     defined |= valid_imported_names(imported_symbols, idx, dep_names, dep_roots)
+    # A star import whose source cannot be enumerated may have bound any name;
+    # unproven bare calls in this file must then stay silent.
+    star_open = star_imports_unresolved(imported_symbols, idx)
     # Dependency API names.
     defined |= dep_names
     # Full builtin set instead of a hand-picked subset.
@@ -1075,6 +1084,7 @@ def scan_file(file_path: str) -> dict:
         imported_symbols=imported_symbols,
         dep_roots=dep_roots,
         dep_enumerated=dep_enumerated,
+        star_open=star_open,
     )
     report = build_report(file=str(p), findings=findings, checked=checked)
     report["defined_symbols"] = len(defined)
