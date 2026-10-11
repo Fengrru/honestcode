@@ -1,17 +1,17 @@
 """Effect-class taxonomy for agent side effects.
 
-Ported from ``nexus-runtime/crates/nexus-core/src/effects.rs``, with two
-corrections to the upstream behaviour (see :mod:`honestcode.guards.guard` for
-the third):
+Two properties of this table are deliberate departures from the earlier
+implementation this derives from (see :mod:`honestcode.guards.guard` for the
+third):
 
 * ``classify`` defaults to *unknown → irreversible*, not → idempotent. The
   2026 consensus across the effect-classification literature is that an
-  unrecognised action is the one you must not silently retry; the upstream
-  default made an unknown action retryable. Guessing "idempotent" for something
-  you do not recognise is the unsafe direction, and the failure it produces
-  (a duplicated external mutation) is exactly what this module exists to
-  prevent.
-* The substring fallback is bounded to word-ish matches instead of
+  unrecognised action is the one you must not silently retry; defaulting an
+  unknown action to idempotent makes it retryable. Guessing "idempotent" for
+  something you do not recognise is the unsafe direction, and the failure it
+  produces (a duplicated external mutation) is exactly what this module exists
+  to prevent.
+* The substring fallback is bounded to word-ish matches rather than a plain
   ``target.contains(...)``, so a path like ``/srv/pushkin/report.txt`` no
   longer classifies as irreversible because it contains ``push``.
 

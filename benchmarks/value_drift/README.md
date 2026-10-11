@@ -116,27 +116,26 @@ where search strings are not hand-authored to be solvable, and the measured
 quantity is how often the guard's refusals turn a would-be drift into a safe
 `no_match`.
 
-## Relationship to the TypeScript suite
+## A second copy of these episodes
 
-The regression now lives where the code it tests lives: the same ten episodes
-were ported to `awesome-agent-infra/packages/fuzzy-patch/__tests__/` as Bun
-tests, alongside a self-test that proves their detector can tell a correct edit
-from a drifting one. That copy runs with the package's own suite; this one runs
-with honestcode's.
+The same ten episodes also run as Bun tests alongside the matcher they exercise,
+where the regression belongs: they are what the matcher has to keep passing, and
+that suite carries a self-test proving its detector can tell a correct edit from
+a drifting one.
 
-What this side keeps and the other does not is the **comparison**.
+What this copy keeps and that one does not is the **comparison**.
 `strategies.py` carries a conservative competitor matcher (similarity floor +
 uniqueness), which is the shape the 2026 edit-application ecosystem converged on.
-It refused nine of the ten, and reproducing that is the reason to keep two copies
-rather than one.
+It refused nine of the ten, and reproducing that is why two copies exist rather
+than one.
 
 If the episodes change, change both. The `SCENARIOS` table is the same data and
 the two are meant to stay in step.
 
 ## Provenance
 
-`strategies.py` is a port of `packages/fuzzy-patch/src/index.ts` from
-`awesome-agent-infra` (the guard lives at lines 100–136 of that file). The port
-is intended to be behaviour-preserving, including the values-normalisation used
-by `preservesValueTokens`; if the upstream implementation changes, this port has
-to change with it or the comparison stops meaning anything.
+`strategies.py` is a behaviour-preserving port of the matcher this corpus was
+built to test, including the values-normalisation used by its value guard. It is
+a port rather than a reimplementation on purpose: the comparison only means
+something if the matcher measured is the matcher in use. If that implementation
+changes, this port has to change with it or the numbers stop describing it.

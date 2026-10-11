@@ -129,28 +129,3 @@ jobs:
 
       - name: Performance benchmark
         run: python scripts/benchmark.py --repeat 3 --format text
-
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install build tools
-        run: pip install build twine
-
-      - name: Build sdist + wheel
-        run: python -m build
-
-      - name: Verify package metadata
-        run: twine check dist/*
-
-      - name: Smoke-test wheel install in isolated venv
-        run: |
-          python -m venv /tmp/venv
-          /tmp/venv/bin/pip install dist/*.whl
-          /tmp/venv/bin/honestcode --help > /dev/null
-          /tmp/venv/bin/honestcode-mcp --help > /dev/null

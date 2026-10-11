@@ -1,15 +1,14 @@
 """The side-effect guard: the crash-safe wrapper around an agent's tool calls.
 
-Ported from ``nexus-runtime/crates/nexus-core/src/effects.rs``. Three upstream
-defects are fixed here rather than carried over, and each is called out at the
-site where it matters:
+Three defects in the earlier implementation this derives from are fixed here
+rather than carried over, and each is called out at the site where it matters:
 
-1. **The idempotency key was computed and discarded.** Upstream wrote
+1. **The idempotency key was computed and discarded.** The earlier code wrote
    ``let _idempotency_key = ...`` and then compared raw ``request_hash``
    values in memory. Here the key is derived, persisted, and enforced by a
    ``UNIQUE`` constraint, so it survives a restart — which is the only
    situation in which idempotency is worth anything.
-2. **Failure was recorded as success.** Upstream set ``status = Committed``,
+2. **Failure was recorded as success.** It set ``status = Committed``,
    *then* checked ``if !result.success { status = Failed }``, so a throwing
    executor left a committed record and the next attempt served a receipt for
    work that never happened. The order is inverted here.

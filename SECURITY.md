@@ -33,8 +33,7 @@ such as a container or dedicated virtual machine.
 
 ## Scope
 
-This security policy applies to the official `honestcode` package
-distributed via PyPI and the source code in this repository.
+This security policy applies to the source code in this repository.
 
 ## Disclosure Policy
 

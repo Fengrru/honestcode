@@ -101,8 +101,8 @@ Temporal and Restate both guarantee deterministic *replay of orchestration* and
 leave exactly-once external effects to the application. This adds the missing
 piece: classify the effect, key it, persist the key, refuse to run it again.
 
-Ported from `effects.rs` in `nexus-runtime`, where the design was sound and the
-implementation had three defects that are fixed here rather than carried over:
+Derived from an earlier implementation whose design was sound and whose code
+had three defects that are fixed here rather than carried over:
 
 1. **The idempotency key was computed and discarded.** Upstream wrote
    `let _idempotency_key = ...` and then compared raw `request_hash` values in

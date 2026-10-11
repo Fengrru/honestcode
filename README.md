@@ -10,8 +10,6 @@ before your agent moves on.
 ![HonestCode invented API demo](demos/invented-api/demo.gif)
 
 [![CI](https://github.com/Fengrru/honestcode/actions/workflows/ci.yml/badge.svg)](https://github.com/Fengrru/honestcode/actions/workflows/ci.yml)
-[![PyPI version](https://img.shields.io/pypi/v/honestcode)](https://pypi.org/project/honestcode/)
-[![Python versions](https://img.shields.io/pypi/pyversions/honestcode)](https://pypi.org/project/honestcode/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -117,7 +115,9 @@ missed finding for a false one.
 ## Install
 
 ```bash
-pip install honestcode
+git clone https://github.com/Fengrru/honestcode
+cd honestcode
+pip install -e .
 ```
 
 Requires Python >= 3.10. 100% local.
