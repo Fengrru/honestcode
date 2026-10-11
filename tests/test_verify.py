@@ -70,6 +70,70 @@ def test_invented_api_via_constructor(project: Path):
     assert finding["symbol"] == "refresh_token"
 
 
+def test_constructed_receiver_guards_stay_quiet(project: Path):
+    """Receivers that do not resolve to a class must not be judged.
+
+    Each guard here exists to keep a false positive away: an unjudgeable
+    receiver is not evidence that its method is invented.
+    """
+    (project / "auth" / "factory.py").write_text("def make():\n    return None\n", encoding="utf-8")
+    cases = [
+        "def f(xs):\n    xs[0]()\n",  # target is not an attribute
+        "a = 'x'; b = 'y'\n(a + b)().foo()\n",  # inner target is not a name
+        "def f(mk):\n    mk().foo()\n",  # receiver name resolves to nothing
+        "handler = None\nhandler().foo()\n",  # receiver resolves, but is not a class
+        "from auth.factory import make\ndef f():\n    make().foo()\n",  # resolves to a function, not a class
+    ]
+    for code in cases:
+        assert _finding(project, code) is None, code
+
+
+def test_invented_api_on_inline_constructor(project: Path):
+    """``UserClient().refresh_token()`` — the chained form, no intermediate name.
+
+    The receiver here is the constructor call itself rather than a variable, so
+    the target is not a dotted name. The type is still known, and skipping it
+    left invented methods on one of the most common Python call styles
+    unreported.
+    """
+    code = "from auth.client import UserClient\ndef login():\n    UserClient().refresh_token()\n"
+    finding = _finding(project, code)
+    assert finding is not None
+    assert finding["kind"] == "invented_api"
+    assert finding["symbol"] == "refresh_token"
+    assert finding["owner"] == "UserClient"
+    assert finding["evidence"]["did_you_mean"] == "refresh_access_token"
+
+
+def test_wrong_arity_on_inline_constructor(project: Path):
+    """The same receiver path must also feed the arity check."""
+    code = (
+        "class Sink:\n"
+        "    def write(self, data):\n        return None\n"
+        "def f():\n"
+        "    Sink().write()\n"
+    )
+    finding = _finding(project, code)
+    assert finding is not None
+    assert finding["kind"] == "wrong_call"
+
+
+def test_legitimate_inline_constructor_call_is_not_flagged(project: Path):
+    """A valid chained call stays clean."""
+    code = (
+        "from auth.client import UserClient\n"
+        "def login():\n"
+        "    return UserClient().refresh_access_token()\n"
+    )
+    assert _finding(project, code) is None
+
+
+def test_complex_call_target_still_unjudged(project: Path):
+    """``(a + b).foo()`` is not a constructor chain and stays unjudged."""
+    code = "a = 'x'; b = 'y'\n(a + b).foo()\n"
+    assert _finding(project, code) is None
+
+
 def test_invented_api_on_self(project: Path):
     """``self.refresh_token()`` is caught inside a class that defines refresh()."""
     code = (

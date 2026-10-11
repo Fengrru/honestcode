@@ -104,6 +104,14 @@ that exists in the codebase the agent is editing. (HonestCode does not do full
 type inference — its structural checks catch mismatched arities, iterating
 `None`, and calling constants, not general type errors.)
 
+What a call site is checked against depends on how the receiver's type is known:
+an annotation (`client: UserClient`), a constructor assignment
+(`client = UserClient()`), `self`/`cls`, and an inline constructor
+(`UserClient().refresh()`) are all resolved. A receiver produced by a factory
+function (`make_client().refresh()`) is **not** judged — function signatures
+carry no return type in the surface model, and guessing there would trade a
+missed finding for a false one.
+
 ---
 
 ## Install

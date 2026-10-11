@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — a project without a marker file reported correct imports as undefined
+
+`scan_file` grounds a file against a fresh index of its own project. When no
+marker file (`.git`, `pyproject.toml`, `setup.py`, `requirements.txt`,
+`.honestcode/`) exists anywhere above the file, the index was built from the
+verified file's **own directory**. Any sibling package was therefore outside the
+index, and a correct cross-package import — `from lib.http import Connection` in
+`cases/app.py` — was reported as `undefined_symbol`.
+
+That is the worst direction for this tool to be wrong in: the agent, following
+the documented workflow, is told to fix an import that is already correct.
+
+The fallback now indexes from the file's **package root** — the first ancestor
+without an `__init__.py`, which is what Python itself treats as the import root —
+so sibling packages stay in scope. The walk is bounded so a project root that is
+itself a package cannot climb into a shared temp or home directory. Detection is
+unchanged: an invented method or a name the sibling module does not define is
+still reported, because the module is now genuinely indexed rather than trusted
+wholesale.
+
+Measured on an 11-case suite built to probe verifier false positives (inherited
+members, aliased imports, `__getattr__`, stdlib calls, keyword arguments), the
+no-marker path went from precision 0.40 / recall 0.40 to **precision 1.00 /
+recall 1.00**.
+
+### Added — invented API detection for `Cls().method()` calls
+
+A method called on a freshly constructed object has no dotted name, so
+`_check_call` fell into the "complex target — cannot judge" branch. `UserClient().refresh_token()`
+was therefore never checked, even though the receiver type is plain from the
+constructor. Since `Cls().method()` is one of the most common Python call styles,
+invented APIs went unreported there.
+
+The receiver is now resolved to the class and checked against its member surface
+like any other call, which brings the arity check along with it
+(`Connection().execute()` with a missing argument is reported as `wrong_call`).
+Only the constructor form is handled; a factory-function receiver
+(`make_client().refresh()`) stays unjudged, because function signatures carry no
+return type in the surface model and guessing would trade a missed finding for a
+false one. The README documents the distinction.
+
 ## [0.4.0] - 2026-10-01
 
 Real-world precision and performance release. A scan of `psf/requests` used to

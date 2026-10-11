@@ -479,7 +479,13 @@ class _Verifier:
     def _check_call(self, call: ast.Call, scope: _Scope) -> None:
         name = call_name(call.func)
         if name is None:
-            # Complex target ((a + b).foo(), super().x()) — cannot judge.
+            # A method called on a freshly constructed object — ``Cls().method()``
+            # — has no dotted name, but its receiver type is known whenever
+            # ``Cls`` resolves to a class in the index. Skipping it let invented
+            # methods on one of the most common Python call styles go
+            # unreported. Everything else here (``(a + b).foo()``,
+            # ``super().x()``) stays unjudged.
+            self._check_constructed_receiver_call(call)
             return
         self.checked += 1
         receiver, _, attr = name.rpartition(".")
@@ -509,6 +515,31 @@ class _Verifier:
         if qname is None:
             return
         self._check_member_call(call, qname, attr)
+
+    def _check_constructed_receiver_call(self, call: ast.Call) -> None:
+        """Verify ``Cls().method()`` against the member surface of ``Cls``.
+
+        Handles only the constructor form. A receiver produced by a factory
+        function (``make_client().method()``) is not judged, because function
+        signatures carry no return annotation in the surface model — guessing
+        there would trade a missed finding for a false one.
+        """
+        func = call.func
+        if not isinstance(func, ast.Attribute):
+            return
+        inner = func.value
+        if not isinstance(inner, ast.Call):
+            return
+        inner_name = call_name(inner.func)
+        if inner_name is None:
+            return
+        qname = self.resolver.resolve(inner_name)
+        if qname is None:
+            return
+        if self.store.class_surface(qname) is None:
+            return  # Not a class — nothing to verify against.
+        self.checked += 1
+        self._check_member_call(call, qname, func.attr)
 
     def _check_bare_call(self, call: ast.Call, name: str) -> None:
         base = name.split(".")[0]
