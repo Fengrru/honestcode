@@ -284,15 +284,24 @@ Current results (6 tasks, deterministic verification):
 
 | task | expected issue | broken detected | fixed clean | broken ms | fixed ms |
 |---|---|---|---|---|---|
-| invented_method | invented_api (`UserClient.refresh_token`) | yes | yes | 16.1 | 17.7 |
-| invented_module_attr | invented_api (`Connection.query`) | yes | yes | 16.9 | 16.9 |
-| undefined_import | undefined_symbol (`delete_user`) | yes | yes | 15.8 | 14.3 |
-| wrong_signature | wrong_call (`add()`) | yes | yes | 22.2 | 16.8 |
-| cross_file_new_symbol | invented_api (`fly`) | yes | yes | 18.5 | 182.2 |
-| dep_alias_and_pypi_name | invented_api (`toll`) | yes | yes | 15.9 | 17.5 |
+| invented_method | invented_api (`UserClient.refresh_token`) | yes | yes | 4.18 | 3.78 |
+| invented_module_attr | invented_api (`Connection.query`) | yes | yes | 4.19 | 3.95 |
+| undefined_import | undefined_symbol (`delete_user`) | yes | yes | 2.69 | 3.55 |
+| wrong_signature | wrong_call (`add()`) | yes | yes | 3.56 | 3.35 |
+| cross_file_new_symbol | invented_api (`fly`) | yes | yes | 3.85 | 2.45 |
+| dep_alias_and_pypi_name | invented_api (`toll`) | yes | yes | 3.44 | 2.9 |
 
 **Summary:** precision 1.0, recall 1.0, F1 1.0, false-positive rate 0.0, median
-verify time 33.7 ms.
+verify time 4–7 ms on a laptop.
+
+The per-task milliseconds above are one run's output, not a guarantee — they
+move a few tens of percent between runs on the same machine. What is stable, and
+what the benchmark is gating on, is the first four columns plus the summary's
+counts.
+
+The summary line is `python benchmarks/agent_accuracy/run.py` verbatim rather
+than a figure copied into this file, because a timing quoted here goes stale the
+moment the code gets faster — as one did. Reproduce it with `--format markdown`.
 
 The `cross_file_new_symbol` task pins the agent-session flow (write a module,
 then a file importing it — the index must be fresh, never stale); the
@@ -311,8 +320,11 @@ positive.
 
 ```bash
 python benchmarks/realworld_fp/run.py
-# files: 19  findings: 0  elapsed: 5.4s (286 ms/file)
+# files: 19  findings: 0  elapsed: 0.4s (~20 ms/file)
 ```
+
+The finding count is the claim; the elapsed time is indicative, and varies with
+the machine.
 
 ### Performance benchmark
 

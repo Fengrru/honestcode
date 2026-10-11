@@ -2,19 +2,20 @@
 
 ## Supported Versions
 
+The package is at 0.4.0. Only the current release is supported; there is no
+maintenance branch for earlier versions.
+
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
-| < 0.1.0 | :x:                |
+| 0.4.x   | :white_check_mark: |
+| < 0.4.0 | :x:                |
 
 ## Reporting a Vulnerability
 
-If you discover a security issue, please email the maintainers directly rather
-than opening a public issue. We will respond as quickly as possible and work
-with you to assess and address the problem responsibly.
-
-**Email:** security@honestcode.example (replace with a real address when
-available).
+If you discover a security issue, please open a
+[private security advisory](https://github.com/Fengrru/honestcode/security/advisories/new)
+rather than a public issue. GitHub notifies the maintainer and keeps the report
+private until a fix is ready.
 
 Please include:
 
