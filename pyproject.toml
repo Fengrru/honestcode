@@ -82,7 +82,6 @@ Homepage = "https://github.com/Fengrru/honestcode"
 Documentation = "https://github.com/Fengrru/honestcode#readme"
 Repository = "https://github.com/Fengrru/honestcode"
 Issues = "https://github.com/Fengrru/honestcode/issues"
-Changelog = "https://github.com/Fengrru/honestcode/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["honestcode*"]

@@ -4,7 +4,7 @@ Durable idempotency for agent tool calls. An effect that already reached the
 outside world is not carried out a second time.
 
 ```bash
-pip install "honestcode[pydantic-ai]"
+pip install -e ".[pydantic-ai]"    # from a checkout of this repository
 ```
 
 ## Why this is not just `CallDeferred`

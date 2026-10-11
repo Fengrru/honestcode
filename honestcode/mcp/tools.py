@@ -939,8 +939,8 @@ def _scan_non_python(p: Path) -> dict:
         return {
             "success": False,
             "error": f"Unsupported language for {p.suffix or 'file'}. "
-            "Python is fully supported; other languages need "
-            "'pip install honestcode[multi-language]'.",
+            "Python is fully supported; other languages need the "
+            "multi-language extra: pip install -e '.[multi-language]'.",
         }
     try:
         symbols = multi_lang.extract_symbols(p)

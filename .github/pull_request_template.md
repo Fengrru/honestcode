@@ -17,4 +17,3 @@ Closes #...
 - [ ] Format passes (`ruff format --check honestcode tests scripts`)
 - [ ] Benchmarks pass (`python benchmarks/agent_accuracy/run.py`)
 - [ ] Documentation updated (if applicable)
-- [ ] CHANGELOG.md updated (if applicable)

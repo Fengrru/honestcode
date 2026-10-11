@@ -80,7 +80,6 @@ outlines how to contribute code, report issues, and request features.
 - Keep PRs focused on a single change.
 - Include a clear description of what changed and why.
 - Ensure all CI checks pass.
-- Add entries to `CHANGELOG.md` under "Unreleased" for user-facing changes.
 - Reference related issues (e.g. "Closes #123").
 
 ## Reporting Issues

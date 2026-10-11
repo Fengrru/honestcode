@@ -52,8 +52,8 @@ try:  # pragma: no cover - import guard only
     from pydantic_ai.exceptions import ModelRetry
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "honestcode.integrations.pydantic_ai requires pydantic-ai; "
-        "install it with `pip install honestcode[pydantic-ai]`"
+        "honestcode.integrations.pydantic_ai requires pydantic-ai. "
+        "From a checkout, install it with: pip install -e '.[pydantic-ai]'"
     ) from exc
 
 if TYPE_CHECKING:  # pragma: no cover
