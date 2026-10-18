@@ -36,7 +36,7 @@ from honestcode.integrations.pydantic_ai import ChargePolicy, EffectGuardCapabil
 
 cap = EffectGuardCapability(
     store=EffectStore(".agent/effects.db"),
-    run_id="order-4711-fulfilment",     # stable across retries
+    run_id="order-4711-fulfilment",  # stable across retries
     policy=ChargePolicy(approve_irreversible=True),
 )
 agent = Agent(model, tools=[charge_card], capabilities=[cap])
@@ -108,7 +108,7 @@ is **refused** until the application says otherwise:
 ```python
 policy = ChargePolicy(
     approve_irreversible=True,
-    read_only_tools=frozenset({"search_docs", "list_index"}),   # declared reads
+    read_only_tools=frozenset({"search_docs", "list_index"}),  # declared reads
     # or, for anything needing more nuance:
     # classify=lambda tool, target: EffectClass.PURE if tool.startswith("get_") else ...,
 )
@@ -127,16 +127,16 @@ Recovering is a decision, not an automatic step. Someone checks the vendor:
 
 ```python
 for decision in guard.recover(run_id):
-    print(decision.action)   # 'query_external' for an irreversible effect
+    print(decision.action)  # 'query_external' for an irreversible effect
 ```
 
 Then records what they found, and — if nothing landed — carries the effect
 through under that answer:
 
 ```python
-guard.resolve(effect_id, COMPENSATED)              # operator: nothing went through
+guard.resolve(effect_id, COMPENSATED)  # operator: nothing went through
 outcome = await guard.recovered_retry(effect_id, execute=charge_card)
-print(outcome.executed)                             # True: the charge ran, once
+print(outcome.executed)  # True: the charge ran, once
 ```
 
 `recovered_retry` refuses the two cases that must never be papered over: a
