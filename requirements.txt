@@ -4,4 +4,4 @@
 # mcp 2.x removed `mcp.server.fastmcp`; pin <2.0 until we adapt to the new API.
 mcp>=1.6.0,<2.0
 pyyaml>=6.0
-tomli>=2.0.0; python_version<"3.11"
+tomli>=2.4.1; python_version<"3.11"
