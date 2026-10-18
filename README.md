@@ -131,8 +131,8 @@ Requires Python >= 3.10. 100% local.
 claude mcp add honestcode -- honestcode-mcp
 ```
 
-Or add it manually to your Claude Code config (`~/.claude/config.json` on
-macOS/Linux, `%LOCALAPPDATA%\Claude\config.json` on Windows):
+Or add it manually to your Claude Code config (`~/.claude.json` on
+macOS/Linux, `%USERPROFILE%\.claude.json` on Windows):
 
 ```json
 {
@@ -245,8 +245,8 @@ The loop is deterministic and auditable.
 
 ## MCP tools
 
-By default only `scan_file` is exposed. Set `HONESTCODE_TOOLS=all` to enable the
-full set, including:
+By default `scan_file` and `verify_file` are exposed. Set `HONESTCODE_TOOLS=all`
+to enable the full set, including:
 
 | Tool | Purpose |
 |:--|:--|
@@ -257,6 +257,11 @@ full set, including:
 | `check_symbol` | Verify a symbol is defined. |
 | `check_api` | Verify a library API call exists. |
 | `validate_types` | Structural type checks. |
+
+Dependency manifests (`requirements.txt`, `pyproject.toml`) are declared
+automatically on the first scan, so imports from a dependency that is not
+installed in the MCP server's interpreter are trusted rather than reported as
+invented. Set `HONESTCODE_AUTO_DEPS=0` to disable that.
 
 See the old tool reference below for the complete list.
 
@@ -297,7 +302,10 @@ Refusing is the default direction: an unrecognised action is treated as
 irreversible rather than idempotent, and irreversible effects need explicit
 approval. A run that dies between the call and the record leaves the effect
 `executing`, and the next attempt reports the outcome as unknown instead of
-guessing — which is what stops the retry.
+guessing — which is what stops the retry. Scoped effects are recovered with
+`guard.recover(scope=durable_scope(...))`, and `guard.effects(scope=...)` /
+`guard.summary(scope=...)` report them; the records live under a namespace
+derived from the scope so a restart can still find them.
 
 For a framework, `integrations/` binds the guard to pydantic-ai, where a
 committed effect replaces the tool result instead of re-running the tool. See
@@ -307,7 +315,7 @@ committed effect replaces the tool result instead of re-running the tool. See
 
 ## Benchmark
 
-HonestCode includes three benchmark suites that run automatically in CI on every
+HonestCode includes four benchmark suites that run automatically in CI on every
 push and pull request to `main`:
 
 ### Agent-accuracy benchmark
@@ -369,6 +377,21 @@ python benchmarks/realworld_fp/run.py
 The finding count is the claim; the elapsed time is indicative, and varies with
 the machine.
 
+### Value-drift benchmark
+
+`benchmarks/value_drift/` asks a different question: when a formatting-tolerant
+edit matcher resolves a search string, did the edit land on the region the
+caller named, or silently on a near-miss sibling that carries a different value?
+It runs ten scenarios across a guarded matcher cascade and an unguarded one, and
+classifies each edit as `correct`, `silent_drift`, `no_match`, or `wrong_span`.
+The guarded matcher must produce the intended edit on every scenario; a
+`no_match` is a refusal, not a pass.
+
+```bash
+python benchmarks/value_drift/run.py            # human-readable
+python benchmarks/value_drift/run.py --json     # machine-readable (status on stderr)
+```
+
 ### Performance benchmark
 
 `scripts/benchmark.py` measures the latency of core operations (index, scan,
@@ -380,9 +403,12 @@ python scripts/benchmark.py --format markdown        # table for README
 python scripts/benchmark.py --repo psf/requests      # benchmark a real-world repo
 ```
 
-All three benchmarks run in CI (`.github/workflows/ci.yml`) as separate jobs:
-`benchmark-accuracy`, `benchmark-realworld`, and `benchmark-performance`. A benchmark failure blocks
-the build if precision or recall drops below 1.0.
+All four benchmarks run in CI (`.github/workflows/ci.yml`) as separate jobs:
+`benchmark-accuracy`, `benchmark-realworld`, `benchmark-value-drift`, and
+`benchmark-performance`. The accuracy job gates on precision and recall staying
+at 1.0, the real-world job on any finding or failed scan, and the value-drift
+job on every guarded scenario landing correctly. The performance job reports
+numbers rather than gating on them.
 
 See `benchmarks/agent_accuracy/README.md` for the dataset format and how to
 add new accuracy tasks.
@@ -404,8 +430,8 @@ honestcode/
 └── cli.py         # Command-line interface
 ```
 
-`verify_file` is the agent interface. `scan_file` is the default MCP tool and
-returns both the new evidence shape and the legacy `issues` list.
+`verify_file` is the agent interface. `scan_file` is exposed alongside it by
+default and returns both the new evidence shape and the legacy `issues` list.
 
 Two of those directories answer a different question from the rest. Everything
 above `guards/` asks *is this code consistent with the repository*. `guards/`
@@ -423,7 +449,7 @@ enforces that with an AST import check.
 
 ## Roadmap
 
-### v0.1 — Repository grounding (now)
+### v0.1 — Repository grounding (done)
 - symbol / API / function / class / method / import / call verification
 - invented API detection with structured evidence
 - auto-index on `scan_file`

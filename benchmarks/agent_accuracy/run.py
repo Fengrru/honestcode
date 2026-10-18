@@ -163,6 +163,11 @@ def evaluate_task(task: Task) -> dict[str, Any]:
 
         broken_findings = broken["report"].get("findings", [])
         broken_match = any(_matches_expected(f, task) for f in broken_findings)
+        # Every finding that is not the expected one is a false positive, even
+        # on the broken file. The old precision only looked at the fixed file,
+        # so a verifier that yelled about ten unrelated things while also
+        # catching the planted bug still scored 1.0.
+        spurious = [f for f in broken_findings if not _matches_expected(f, task)]
 
         fixed_findings = fixed["report"].get("findings", [])
         fixed_status = fixed["report"].get("status", "unknown")
@@ -177,6 +182,7 @@ def evaluate_task(task: Task) -> dict[str, Any]:
                 "status": broken["report"].get("status"),
                 "findings_count": len(broken_findings),
                 "detected": broken_match,
+                "spurious_findings": len(spurious),
                 "findings": broken_findings,
                 "elapsed_ms": round(broken["elapsed_ms"], 2),
             },
@@ -191,11 +197,21 @@ def evaluate_task(task: Task) -> dict[str, Any]:
 
 
 def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """Compute precision, recall, F1, and false-positive rate."""
+    """Compute precision, recall, F1, and false-positive rate.
+
+    A *false positive* here is a task on which the verifier reported anything
+    besides the expected finding: an extra finding on the broken file, or any
+    finding on the fixed file. A task with the expected finding plus noise is
+    counted in both ``true_positives`` and ``false_positives`` on purpose —
+    the noise has to move the precision number.
+    """
     tp = sum(1 for r in results if r["broken"]["detected"])
     fn = sum(1 for r in results if not r["broken"]["detected"])
     tn = sum(1 for r in results if r["fixed"]["clean"])
-    fp = sum(1 for r in results if not r["fixed"]["clean"])
+    fp = sum(1 for r in results if r["broken"]["spurious_findings"] or not r["fixed"]["clean"])
+    spurious_findings = sum(
+        r["broken"]["spurious_findings"] + r["fixed"]["findings_count"] for r in results
+    )
 
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
@@ -210,6 +226,7 @@ def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
         "false_negatives": fn,
         "true_negatives": tn,
         "false_positives": fp,
+        "spurious_findings": spurious_findings,
         "precision": round(precision, 3),
         "recall": round(recall, 3),
         "f1": round(f1, 3),
@@ -245,6 +262,7 @@ def render_text(results: list[dict[str, Any]], metrics: dict[str, Any]) -> str:
     lines.append(f"false negatives: {metrics['false_negatives']}")
     lines.append(f"true negatives:  {metrics['true_negatives']}")
     lines.append(f"false positives: {metrics['false_positives']}")
+    lines.append(f"spurious findings: {metrics['spurious_findings']}")
     lines.append(f"precision: {metrics['precision']}")
     lines.append(f"recall:    {metrics['recall']}")
     lines.append(f"F1:        {metrics['f1']}")
@@ -273,6 +291,7 @@ def render_markdown(results: list[dict[str, Any]], metrics: dict[str, Any]) -> s
         f"- precision: {metrics['precision']}, recall: {metrics['recall']}, F1: {metrics['f1']}"
     )
     lines.append(f"- false positive rate: {metrics['false_positive_rate']}")
+    lines.append(f"- spurious findings: {metrics['spurious_findings']}")
     lines.append(f"- median verify time: {metrics['median_verify_ms']}ms")
     return "\n".join(lines)
 

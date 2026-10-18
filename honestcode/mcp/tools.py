@@ -27,6 +27,7 @@ import re
 import sqlite3
 import subprocess
 import threading
+from contextlib import suppress
 from pathlib import Path
 
 from honestcode.graph.graph_store import CallGraph, GraphCache
@@ -37,10 +38,18 @@ from honestcode.mcp.knowledge_base import APIKnowledgeBase
 from honestcode.sandbox import SandboxExecutor
 from honestcode.structure.extractor import StructureExtractor
 from honestcode.structure.relations import ParseResult
-from honestcode.structure.utils import call_name, module_name_for, stdlib_roots
+from honestcode.structure.utils import (
+    call_name,
+    iter_python_files,
+    module_name_for,
+    read_python_source,
+    stdlib_roots,
+)
 from honestcode.verify.evidence import (
     ACTION_INSPECT,
+    CONFIDENCE_LOW,
     KIND_SYNTAX_ERROR,
+    KIND_UNDEFINED_SYMBOL,
     Finding,
     build_report,
     render_text,
@@ -69,6 +78,15 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _AUTO_INDEX_ENABLED = os.environ.get("HONESTCODE_AUTO_INDEX", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+# Auto-declaring the project's dependencies (without importing them) is what
+# keeps a normal project from reporting every `from dep import X` as undefined
+# when the MCP server runs in a different interpreter than the project's venv.
+_AUTO_DEPS_ENABLED = os.environ.get("HONESTCODE_AUTO_DEPS", "1").lower() not in {
     "0",
     "false",
     "no",
@@ -121,6 +139,11 @@ def _package_root(start: Path) -> Path | None:
 # grounds one of them with the other's index. Entries hold whatever
 # get_project_index returned last; freshness is re-validated inside it.
 _index_by_root: dict[str, ProjectIndex] = {}
+
+# Project root -> manifest fingerprint for the last automatic dependency
+# declaration. Keeps the (cheap, but not free) manifest parse out of every scan
+# while still noticing an edited requirements.txt / pyproject.toml.
+_deps_stamp_by_root: dict[str, tuple] = {}
 
 
 def _index_for_file(path: Path) -> ProjectIndex | None:
@@ -223,6 +246,50 @@ def _cache_dir() -> Path:
     return Path(os.environ.get("HONESTCODE_CACHE_DIR", os.path.expanduser("~/.cache/honestcode")))
 
 
+def _manifest_stamp(root: Path) -> tuple | None:
+    """Fingerprint the dependency manifests, or ``None`` when neither exists."""
+    stamp: list[tuple] = []
+    found = False
+    for name in ("requirements.txt", "pyproject.toml"):
+        path = root / name
+        try:
+            st = path.stat()
+        except OSError:
+            stamp.append((name, None, None))
+            continue
+        found = True
+        stamp.append((name, st.st_mtime_ns, st.st_size))
+    return tuple(stamp) if found else None
+
+
+def _ensure_deps_for(root: Path) -> None:
+    """Declare the project's dependencies so their imports are not hallucinations.
+
+    Declared-only on purpose: importing every requirement would execute
+    arbitrary installed code and make the first scan of a data-science project
+    take minutes. Import trust is what prevents ``from flask import Flask``
+    from becoming an ``undefined_symbol`` finding when the server and the
+    project do not share an interpreter; member-level invented-API checks stay
+    silent for packages whose surfaces were never enumerated.
+    """
+    if not _AUTO_DEPS_ENABLED:
+        return
+    stamp = _manifest_stamp(root)
+    if stamp is None:
+        return
+    key = str(root.resolve())
+    with _state_lock:
+        if _deps_stamp_by_root.get(key) == stamp:
+            return
+    try:
+        load_project_deps(str(root), import_packages=False)
+    except Exception:  # noqa: BLE001 - dependency metadata must never break a scan
+        logger.debug("Could not declare dependencies for %s", root, exc_info=True)
+        return
+    with _state_lock:
+        _deps_stamp_by_root[key] = stamp
+
+
 # ── Internal helpers ───────────────────────────────────────────────────
 def _module_name(p: Path, root: Path) -> str:
     """Infer a dotted module name from *p* relative to *root*.
@@ -304,11 +371,9 @@ def _with_module_prefix(p: Path, root: Path, res: ParseResult) -> ParseResult:
 
 
 def _parse_results_for(root: Path) -> dict[Path, ParseResult]:
-    """Parse every *.py file under root and return a path -> ParseResult map."""
+    """Parse every indexable *.py file under root and return a path -> result map."""
     results: dict[Path, ParseResult] = {}
-    for p in root.rglob("*.py"):
-        if p.name.startswith(".") or "__pycache__" in p.parts:
-            continue
+    for p in iter_python_files(root):
         try:
             res = _extractor.parse_file(p)
             results[p] = _with_module_prefix(p, root, res)
@@ -623,6 +688,15 @@ def _parse_pyproject_deps(text: str) -> list[str]:
             elif isinstance(cur, dict):
                 # Poetry declares dependencies as {name: version} pairs.
                 deps.extend(k for k in cur if isinstance(k, str))
+        # Optional groups are still declared project dependencies: the project
+        # may legitimately import them (HonestCode's own optional integrations
+        # are the motivating case). Trusting the declaration silences the
+        # import; member surfaces remain silent until the package is loaded.
+        optional = data.get("project", {}).get("optional-dependencies", {})
+        if isinstance(optional, dict):
+            for group in optional.values():
+                if isinstance(group, list):
+                    deps.extend(_strip_version_spec(d) for d in group if isinstance(d, str))
         return deps
     except Exception:  # noqa: BLE001
         pass
@@ -648,17 +722,40 @@ def _strip_version_spec(dep: str) -> str:
 
 
 def check_symbol(symbol_name: str, file_path: str | None = None) -> dict:
-    """Check whether a symbol is defined in the project."""
+    """Check whether a symbol is defined in the project.
+
+    When *file_path* is supplied, the symbol must be defined in that file: the
+    parameter used to be accepted and then ignored, so a caller could not ask
+    the narrower question it promises.
+    """
     with _state_lock:
         idx = _project_index
     if idx is None:
         return {"success": False, "error": "Project not indexed. Call index_project first."}
+
     info = idx.symbols.get(symbol_name)
+    if file_path:
+        root = Path(idx.root)
+        candidate = Path(file_path)
+        try:
+            rel = candidate.resolve().relative_to(root.resolve()).as_posix()
+        except (OSError, ValueError):
+            rel = str(candidate).replace("\\", "/")
+        info_in_file = [
+            symbol_info
+            for name, symbol_info in idx.symbols.items()
+            if symbol_info.file == rel and (name == symbol_name or name.endswith(f".{symbol_name}"))
+        ]
+        # A short name is matched by its qualified suffix, so the file filter
+        # has to run even when the bare name itself was not an index key.
+        info = info_in_file[0] if info_in_file else None
+
     return {
         "success": True,
         "symbol": symbol_name,
         "defined": info is not None,
         "location": {"file": info.file, "line": info.line} if info else None,
+        **({"file": file_path} if file_path else {}),
     }
 
 
@@ -670,6 +767,15 @@ def check_api(api_name: str) -> dict:
     base = api_name.split(".")[0]
     dep_names = _dep_kb.all_names()
     base_known = _dep_kb.has(base) or any(k.startswith(base + ".") for k in dep_names)
+    if not base_known:
+        # A CLI invocation is a fresh process: the user cannot first run
+        # ``load-package`` and then ``check-api``. Load the base package on
+        # demand (the API name is exactly the package the caller is asking
+        # about, so importing it is the documented behaviour of this tool).
+        with suppress(Exception):  # an absent package is a valid answer
+            _dep_kb.load_package(base)
+        dep_names = _dep_kb.all_names()
+        base_known = _dep_kb.has(base) or any(k.startswith(base + ".") for k in dep_names)
     if not base_known:
         return {
             "success": True,
@@ -840,6 +946,7 @@ _LANG_BUILTINS: dict[str, set[str]] = {
     },
 }
 _LANG_BUILTINS["typescript"] = _LANG_BUILTINS["javascript"]
+_LANG_BUILTINS["tsx"] = _LANG_BUILTINS["javascript"]
 
 _LANG_IMPORT_PATTERNS: dict[str, list[str]] = {
     # Each pattern's group(s) yield imported local names.
@@ -863,6 +970,7 @@ _LANG_IMPORT_PATTERNS: dict[str, list[str]] = {
     ],
 }
 _LANG_IMPORT_PATTERNS["typescript"] = _LANG_IMPORT_PATTERNS["javascript"]
+_LANG_IMPORT_PATTERNS["tsx"] = _LANG_IMPORT_PATTERNS["javascript"]
 
 # Language keywords / soft keywords that syntactically look like calls.
 _LANG_KEYWORDS: set[str] = {
@@ -922,6 +1030,7 @@ _LANG_DECL_PATTERNS: dict[str, list[str]] = {
     ],
 }
 _LANG_DECL_PATTERNS["typescript"] = _LANG_DECL_PATTERNS["javascript"]
+_LANG_DECL_PATTERNS["tsx"] = _LANG_DECL_PATTERNS["javascript"]
 
 
 def _scan_non_python(p: Path) -> dict:
@@ -952,8 +1061,10 @@ def _scan_non_python(p: Path) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"multi-language scan failed: {exc}"}
     try:
-        source = p.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        # Heuristic regex scan: replacement characters only cost a missed match,
+        # whereas a hard UnicodeDecodeError would take the whole tool down.
+        source = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
         return {"success": False, "error": f"cannot read file: {exc}"}
 
     defined = {s["name"] for s in symbols}
@@ -984,7 +1095,7 @@ def _scan_non_python(p: Path) -> dict:
     builtins = _LANG_BUILTINS.get(lang, set())
     keywords = _LANG_KEYWORDS
 
-    issues: list[dict] = []
+    findings: list[Finding] = []
     # Negative lookbehind skips attribute calls (``obj.method(``), which
     # cannot be judged statically; keyword set covers language constructs
     # that look like calls (``new Foo(``, ``require(``, ...).
@@ -992,23 +1103,26 @@ def _scan_non_python(p: Path) -> dict:
         name = m.group(1)
         if name in defined or name in builtins or name in keywords:
             continue
-        line = source[: m.start()].count("\n") + 1
-        issues.append(
-            {
-                "type": "undefined_call",
-                "name": name,
-                "line": line,
-                "confidence": "low",
-            }
+        findings.append(
+            Finding(
+                file=str(p),
+                line=source[: m.start()].count("\n") + 1,
+                kind=KIND_UNDEFINED_SYMBOL,
+                symbol=name,
+                message=(
+                    f"`{name}` is not defined or imported in this file "
+                    f"(heuristic {lang} scan — inspect before changing)."
+                ),
+                evidence={"language": lang, "heuristic": True},
+                confidence=CONFIDENCE_LOW,
+                action=ACTION_INSPECT,
+            )
         )
 
-    return {
-        "success": True,
-        "file": str(p),
-        "language": lang,
-        "issues": issues,
-        "defined_symbols": len(defined),
-    }
+    report = build_report(file=str(p), findings=findings, checked=0)
+    report["language"] = lang
+    report["defined_symbols"] = len(defined)
+    return report
 
 
 def scan_file(file_path: str) -> dict:
@@ -1028,17 +1142,23 @@ def scan_file(file_path: str) -> dict:
     # index_project first; resolving per-file also keeps a session that touches
     # several projects from grounding one with another's index.
     idx = _index_for_file(p)
+    if idx is not None:
+        _ensure_deps_for(Path(idx.root))
+    else:
+        fallback_root = _find_project_root(p)
+        if fallback_root is not None:
+            _ensure_deps_for(fallback_root)
 
     with _state_lock:
         dep_names = _dep_kb.all_names()
         dep_roots = _dep_kb.roots() | {n.split(".", 1)[0] for n in dep_names} | stdlib_roots()
         dep_enumerated = _dep_kb.enumerated_modules()
 
+    source = read_python_source(p)
+    if source is None:
+        return {"success": False, "error": f"cannot read file: {p}"}
     try:
-        source = p.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(p))
-    except (OSError, UnicodeDecodeError) as e:
-        return {"success": False, "error": f"cannot read file: {e}"}
     except SyntaxError as e:
         # A syntax error is itself a verification finding, not a tool failure:
         # the agent needs the structured protocol (status/findings/text) so it
@@ -1101,7 +1221,7 @@ def verify_file(file_path: str) -> dict:
     report = scan_file(file_path)
     if not report.get("success", True):
         return report
-    return {
+    result = {
         "success": True,
         "status": report["status"],
         "file": report["file"],
@@ -1109,6 +1229,10 @@ def verify_file(file_path: str) -> dict:
         "summary": report["summary"],
         "text": render_text(report),
     }
+    for key in ("language", "defined_symbols"):
+        if key in report:
+            result[key] = report[key]
+    return result
 
 
 def load_package_apis(package_name: str) -> dict:
@@ -1124,6 +1248,8 @@ def reset_dependency_state() -> dict:
     session has no reason to call this.
     """
     _dep_kb.reset()
+    with _state_lock:
+        _deps_stamp_by_root.clear()
     return {"success": True}
 
 
@@ -1235,19 +1361,24 @@ def _check_builtin_argc(node: ast.Call, issues: list[dict]) -> None:
     name = node.func.id
     args = len(node.args)
     kwargs = {kw.arg for kw in node.keywords if kw.arg is not None}  # exclude **kwargs
+    # ``str(object='', encoding=..., errors=...)`` accepts three positionals
+    # (``str(b'x', 'utf-8', 'strict')``) and the ``object`` keyword. ``max`` /
+    # ``min`` take ``key`` and ``default`` as keywords, and ``sorted``'s
+    # ``key``/``reverse`` are keyword-only — the previous table inverted all
+    # three and flagged valid calls.
     rules = {
         "len": (1, 1, set()),
         "repr": (1, 1, set()),
-        "str": (0, 1, {"encoding", "errors"}),
+        "str": (0, 3, {"object", "encoding", "errors"}),
         "int": (0, 2, {"base"}),
         "float": (0, 1, set()),
         "bool": (0, 1, set()),
         "abs": (1, 1, set()),
         "round": (1, 2, {"ndigits"}),
         "sum": (1, 2, {"start"}),
-        "min": (1, None, set()),
-        "max": (1, None, set()),
-        "sorted": (1, 3, {"key", "reverse"}),
+        "min": (1, None, {"key", "default"}),
+        "max": (1, None, {"key", "default"}),
+        "sorted": (1, 1, {"key", "reverse"}),
         "enumerate": (1, 2, {"start"}),
         "zip": (0, None, {"strict"}),
         "map": (2, None, set()),
@@ -1358,7 +1489,9 @@ def find_similar_code(threshold: float = 0.85) -> dict:
 
     functions: list[tuple[Path, str, str, tuple[int, int]]] = []
     for p, res in _parse_results_for(root).items():
-        code = p.read_text(encoding="utf-8")
+        code = read_python_source(p)
+        if code is None:
+            continue
         for name, (start, end) in res.func_defs.items():
             lines = code.splitlines()[start : end + 1]
             body = _normalize_code("\n".join(lines))
@@ -1584,10 +1717,24 @@ def affected_files(base: str = "HEAD", head: str | None = None, max_depth: int =
     if root is None:
         return {"success": False, "error": "Project not indexed. Call index_project first."}
 
+    def _valid_ref(ref: str) -> bool:
+        # A leading dash would be parsed by git as an option (``--output=...``
+        # writes a file); newlines cannot be legitimate refs either.
+        return bool(ref) and not ref.startswith("-") and "\n" not in ref and "\r" not in ref
+
+    if not _valid_ref(base) or (head is not None and not _valid_ref(head)):
+        return {
+            "success": False,
+            "error": f"invalid git ref: {base if not _valid_ref(base) else head}",
+        }
+
+    # ``--relative`` makes paths relative to the project root even when it is a
+    # subdirectory of the git repository; without it the changed paths and the
+    # graph's root-relative paths never matched and the result was silently empty.
     if head:
-        proc = _run_git(root, "diff", "--name-only", base, head)
+        proc = _run_git(root, "diff", "--relative", "--name-only", base, head)
     else:
-        proc = _run_git(root, "diff", "--name-only", base)
+        proc = _run_git(root, "diff", "--relative", "--name-only", base)
     if proc is None or proc.returncode != 0:
         err = (proc.stderr if proc else "git unavailable").strip()
         return {"success": False, "error": f"git diff failed: {err}"}

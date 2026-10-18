@@ -21,15 +21,15 @@ import threading
 import time
 from pathlib import Path
 
+from honestcode.structure.utils import iter_python_files
+
 logger = logging.getLogger(__name__)
 
 
 def _take_snapshot(root: Path) -> dict[Path, float]:
     """Map each .py file to its mtime (ns), for change detection."""
     snap: dict[Path, float] = {}
-    for p in root.rglob("*.py"):
-        if "__pycache__" in p.parts or p.name.startswith("."):
-            continue
+    for p in iter_python_files(root):
         try:
             snap[p] = p.stat().st_mtime_ns
         except OSError:

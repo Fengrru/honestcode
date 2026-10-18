@@ -227,7 +227,18 @@ class SandboxExecutor:
             import ctypes
             from ctypes import wintypes
 
-            kernel32 = ctypes.windll.kernel32
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
 
             class IO_COUNTERS(ctypes.Structure):
                 _fields_ = [
@@ -267,7 +278,11 @@ class SandboxExecutor:
 
             JobObjectExtendedLimitInformation = 9
             JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x0100
-            JOB_OBJECT_LIMIT_JOB_TIME = 0x0200
+            # 0x0200 is JOB_OBJECT_LIMIT_JOB_MEMORY, not JOB_TIME. With the
+            # wrong flag the call set a job-memory limit of zero and failed
+            # with ERROR_INVALID_PARAMETER (87), so *none* of the limits —
+            # memory, CPU, kill-on-close — were applied on Windows.
+            JOB_OBJECT_LIMIT_JOB_TIME = 0x0004
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 
             job = kernel32.CreateJobObjectW(None, None)
@@ -305,8 +320,12 @@ class SandboxExecutor:
             return
         try:
             import ctypes
+            from ctypes import wintypes
 
-            ctypes.windll.kernel32.CloseHandle(job_handle)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(job_handle)
         except Exception as e:  # noqa: BLE001
             logger.debug("Could not close job handle: %s", e)
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "honestcode"
-version = "0.4.0"
+dynamic = ["version"]
 description = "The deterministic verification layer for AI coding agents. Catch invented APIs, undefined symbols, and wrong calls before your agent moves on."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -52,6 +52,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.24",
     "pytest-cov>=4.0",
     "ruff>=0.6",
     "pre-commit>=3.0",
@@ -86,10 +87,14 @@ Issues = "https://github.com/Fengrru/honestcode/issues"
 [tool.setuptools.packages.find]
 include = ["honestcode*"]
 
+[tool.setuptools.dynamic]
+version = {attr = "honestcode.__version__"}
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-q --tb=short"
+asyncio_mode = "strict"
 
 [tool.ruff]
 line-length = 100

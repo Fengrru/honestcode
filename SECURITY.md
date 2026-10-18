@@ -28,9 +28,18 @@ Please include:
 
 `execute_code` is designed to catch accidental mistakes and infinite loops, not
 to contain malicious code. It runs in a subprocess with a temporary working
-directory and optional Unix resource limits, but it does not provide full
-isolation. Do not use it to execute untrusted code without additional sandboxing
-such as a container or dedicated virtual machine.
+directory and best-effort resource limits (POSIX rlimits; a Windows Job Object),
+but it does not provide full isolation: the child runs as the current user with
+file-system and network access. Do not use it to execute untrusted code without
+additional sandboxing such as a container or dedicated virtual machine.
+
+## MCP Transport
+
+The stdio transport inherits the permissions of the client that launched it. The
+SSE transport has no authentication. Binding it to a non-loopback address now
+requires `HONESTCODE_ALLOW_NETWORK=1`, and it should only be exposed behind a
+separate access-control layer — a remote caller with `execute_code` enabled can
+run code as the current user.
 
 ## Scope
 

@@ -33,6 +33,7 @@ the same contract the other benchmarks use to gate CI.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import sys
 from dataclasses import dataclass
@@ -108,17 +109,50 @@ def verify_corpus() -> list[str]:
 def classify(
     scenario: Scenario, patched: str, match_index: int, match_length: int, matched_text: str
 ) -> str:
-    """Judge where the edit landed, using region containment not equality."""
-    if matched_text and matched_text in scenario.intended_region:
-        # The named region was rewritten. Confirm the file now holds exactly the
-        # replacement there and is byte-identical everywhere else.
-        expected = (
-            scenario.file[:match_index]
-            + scenario.replace
-            + scenario.file[match_index + match_length :]
-        )
-        return CORRECT if patched == expected else WRONG_SPAN
-    if matched_text and matched_text in scenario.competing_region:
+    """Judge where the edit landed by *span*, not by substring containment.
+
+    The previous implementation rebuilt the expected file from the same
+    ``match_index``/``match_length`` it was judging, so ``patched == expected``
+    was a tautology whenever the matched text was a substring of the intended
+    region — a one-character interior match was scored ``correct``. Here the
+    intended span is located independently and the *result* is judged: the
+    match must lie inside the intended region, the resulting region must carry
+    the replacement's values and not the distractor's, the distractor must
+    remain intact elsewhere in the file, and the file must still parse.
+    """
+    if not matched_text:
+        return NO_MATCH if patched == scenario.file else WRONG_SPAN
+
+    intended_start = scenario.file.index(scenario.intended_region)
+    intended_end = intended_start + len(scenario.intended_region)
+    if intended_start <= match_index and match_index + match_length <= intended_end:
+        if patched == scenario.file:
+            return NO_MATCH
+        # The edit landed somewhere inside the region the caller named. Judge
+        # the *resulting region*, not the whole file: ``forbidden_after`` is
+        # the distractor's value and legitimately remains elsewhere in the
+        # file. The replacement must have taken effect here, and splicing it
+        # must leave valid code — a fragment match that inserts a whole block
+        # into the middle of the region fails the parse check instead of being
+        # scored correct merely because its span was "contained".
+        prefix = scenario.intended_region[: match_index - intended_start]
+        suffix = scenario.intended_region[match_index - intended_start + match_length :]
+        patched_region = prefix + scenario.replace + suffix
+        if scenario.expected_after not in patched_region:
+            return WRONG_SPAN
+        if scenario.forbidden_after in patched_region:
+            return WRONG_SPAN
+        if scenario.competing_region not in patched:
+            return WRONG_SPAN
+        try:
+            ast.parse(patched)
+        except SyntaxError:
+            return WRONG_SPAN
+        return CORRECT
+
+    competing_start = scenario.file.index(scenario.competing_region)
+    competing_end = competing_start + len(scenario.competing_region)
+    if competing_start <= match_index and match_index + match_length <= competing_end:
         return SILENT_DRIFT
     if patched == scenario.file:
         return NO_MATCH
@@ -203,7 +237,7 @@ def print_report(sets: dict[str, list[Outcome]]) -> None:
     changed = [
         (o.scenario.id, o.result, guarded_by_id[o.scenario.id].result)
         for o in sets["unguarded (8 strategies, no value guard)"]
-        if o.result != guarded_by_id[o.scenario.id].result
+        if o.scenario.id in guarded_by_id and o.result != guarded_by_id[o.scenario.id].result
     ]
     if changed:
         for sid, un, g in changed:
@@ -254,12 +288,21 @@ def main() -> int:
         print_report(sets)
 
     guarded = sets[GUARDED_LABEL]
-    failed = [o for o in guarded if o.drifted or o.result == WRONG_SPAN]
+    # Every scenario must land on the region the caller named. Refusing all
+    # edits (``no_match``) used to pass this gate, which made an over-strict
+    # matcher — the recall regression this benchmark exists to catch — green.
+    failed = [o for o in guarded if o.result != CORRECT]
+    status_stream = sys.stderr if args.json else sys.stdout
     if failed:
-        print(f"\nFAIL: the guarded matcher is not fail-safe on {len(failed)} scenario(s)")
+        print(
+            f"\nFAIL: the guarded matcher did not produce the intended edit on "
+            f"{len(failed)} scenario(s)",
+            file=status_stream,
+        )
         return 2
     print(
-        f"\nOK: guarded matcher never landed outside the region the caller named ({len(guarded)} scenarios)"
+        f"\nOK: guarded matcher applied the intended edit on all {len(guarded)} scenarios",
+        file=status_stream,
     )
     return 0
 

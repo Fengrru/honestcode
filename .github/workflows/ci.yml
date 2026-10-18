@@ -66,6 +66,31 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
 
+  test-optional-extras:
+    # The pydantic-ai integration and the multi-language scanners are optional
+    # extras; without this job their tests are skipped on every run and a
+    # breaking dependency upgrade goes unnoticed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies (all extras)
+        run: pip install -e ".[dev,pydantic-ai,multi-language]"
+
+      - name: Test with optional integrations enabled
+        run: pytest
+
+      - name: MCP end-to-end smoke test
+        run: python scripts/e2e_mcp_test.py
+
+      - name: Run the demo end to end
+        run: python demos/invented-api/run.py
+
   benchmark-accuracy:
     runs-on: ubuntu-latest
     steps:

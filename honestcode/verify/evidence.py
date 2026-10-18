@@ -62,6 +62,8 @@ _KIND_ORDER = {
 
 CONFIDENCE_DETERMINISTIC = "deterministic"
 CONFIDENCE_HIGH = "high"
+#: Heuristic (non-Python) findings: a pointer to inspect, never a verdict.
+CONFIDENCE_LOW = "low"
 
 ACTION_REVISE = "revise"
 ACTION_INSPECT = "inspect"

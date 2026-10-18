@@ -20,14 +20,13 @@ import ast
 import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from functools import lru_cache
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-from honestcode.structure.utils import call_name
+from honestcode.structure.utils import call_name, read_python_source
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
 __all__ = [
     "MethodInfo",
@@ -369,26 +368,38 @@ def extract_file_surfaces(
                         surface.attributes.add(local)
         classes[qname] = surface
 
-    # ``setattr(Cls, "name", ...)`` at module level runs at import time and
-    # adds a member no class-body scan can see.
-    for stmt in getattr(tree, "body", ()):
-        if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+    # Module-level statements can add members no class-body scan can see:
+    # ``setattr(Cls, "name", ...)``, and plain ``Cls.name = ...`` (the
+    # monkey-patch/mixin-registration style used by real projects). Treat both
+    # as attributes so an existing member is never claimed absent.
+    for stmt in _iter_class_body_stmts(list(getattr(tree, "body", ()))):
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+            if not (isinstance(call.func, ast.Name) and call.func.id == "setattr"):
+                continue
+            if len(call.args) < 2:
+                continue
+            target, name_arg = call.args[0], call.args[1]
+            if not (
+                isinstance(target, ast.Name)
+                and isinstance(name_arg, ast.Constant)
+                and isinstance(name_arg.value, str)
+            ):
+                continue
+            cls_surface = classes.get(qualified(target.id))
+            if cls_surface is not None:
+                cls_surface.attributes.add(name_arg.value)
             continue
-        call = stmt.value
-        if not (isinstance(call.func, ast.Name) and call.func.id == "setattr"):
-            continue
-        if len(call.args) < 2:
-            continue
-        target, name_arg = call.args[0], call.args[1]
-        if not (
-            isinstance(target, ast.Name)
-            and isinstance(name_arg, ast.Constant)
-            and isinstance(name_arg.value, str)
-        ):
-            continue
-        cls_surface = classes.get(qualified(target.id))
-        if cls_surface is not None:
-            cls_surface.attributes.add(name_arg.value)
+        targets: list[ast.expr] = []
+        if isinstance(stmt, ast.Assign):
+            targets = list(stmt.targets)
+        elif isinstance(stmt, ast.AnnAssign) and stmt.target is not None:
+            targets = [stmt.target]
+        for target in targets:
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                cls_surface = classes.get(qualified(target.value.id))
+                if cls_surface is not None:
+                    cls_surface.attributes.add(target.attr)
 
     # Module-level functions (used for arity checks on imported callables).
     for child in ast.iter_child_nodes(tree):
@@ -446,13 +457,17 @@ _FILE_FACTS: OrderedDict[
 ] = OrderedDict()
 
 
-@lru_cache(maxsize=4096)
 def _read_source(path_str: str) -> str | None:
-    """Cached source read (bounded); ``None`` when unreadable."""
-    try:
-        return Path(path_str).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
+    """Read source fresh; ``None`` when unreadable.
+
+    This used to be ``lru_cache``-d hidden behind ``load_file_facts``'s
+    fingerprint key, so a file edit produced a *new* facts entry built from the
+    *old* cached bytes: a long-lived MCP session kept reporting a method the
+    agent had just added to a base class. The facts cache above already avoids
+    repeated reads while the fingerprint is unchanged, so the extra layer only
+    bought staleness.
+    """
+    return read_python_source(path_str)
 
 
 def load_file_facts(

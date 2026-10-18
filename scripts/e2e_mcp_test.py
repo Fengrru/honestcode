@@ -13,8 +13,15 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path(__file__).parent
-ENV_BASE = {**os.environ, "PYTHONPATH": str(REPO), "PYTHONUNBUFFERED": "1"}
+REPO = Path(__file__).resolve().parents[1]
+# The test controls tool visibility per session; an inherited value would make
+# the "default mode" section silently run in a different mode.
+_CONTROLLED_ENV = {"HONESTCODE_TOOLS", "HONESTCODE_AUTO_INDEX", "HONESTCODE_AUTO_DEPS"}
+ENV_BASE = {
+    **{k: v for k, v in os.environ.items() if k not in _CONTROLLED_ENV},
+    "PYTHONPATH": str(REPO),
+    "PYTHONUNBUFFERED": "1",
+}
 
 
 def _spawn(extra_env: dict | None = None) -> subprocess.Popen:
@@ -93,68 +100,89 @@ def session(extra_env: dict | None, calls: list[dict]) -> list[dict]:
     return out
 
 
+def _payload(response: dict) -> dict:
+    """Extract the JSON payload from a tools/call result."""
+    result = response.get("result")
+    if not isinstance(result, dict) or not result.get("content"):
+        raise RuntimeError(f"tool call failed: {json.dumps(response)[:500]}")
+    return json.loads(result["content"][0]["text"])
+
+
 def main() -> int:
+    failures: list[str] = []
     # A realistic mini-project with a hallucination for the tool call.
-    work = Path(tempfile.mkdtemp(prefix="hc-mcp-e2e-"))
-    pkg = work / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("")
-    (pkg / "client.py").write_text(
-        "class UserClient:\n    def refresh(self):\n        return 1\n\n"
-        "    def refresh_access_token(self):\n        return 2\n"
-    )
-    broken = pkg / "login.py"
-    broken.write_text(
-        "from pkg.client import UserClient\n\n\ndef login(client: UserClient):\n"
-        "    return client.refresh_token()\n"
-    )
+    with tempfile.TemporaryDirectory(prefix="hc-mcp-e2e-") as td:
+        work = Path(td)
+        pkg = work / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "client.py").write_text(
+            "class UserClient:\n    def refresh(self):\n        return 1\n\n"
+            "    def refresh_access_token(self):\n        return 2\n",
+            encoding="utf-8",
+        )
+        broken = pkg / "login.py"
+        broken.write_text(
+            "from pkg.client import UserClient\n\n\ndef login(client: UserClient):\n"
+            "    return client.refresh_token()\n",
+            encoding="utf-8",
+        )
 
-    print("=" * 70)
-    print("A) DEFAULT MODE (no HONESTCODE_TOOLS) — expect only scan_file")
-    print("=" * 70)
-    resp = session(None, [{"name": "verify_file", "arguments": {"file_path": str(broken)}}])
-    init = resp[0].get("result", {})
-    print("serverInfo:", json.dumps(init.get("serverInfo", {})))
-    print("protocolVersion:", init.get("protocolVersion"))
-    tools = resp[1].get("result", {}).get("tools", [])
-    print("tools exposed:", [t["name"] for t in tools])
-    call = resp[2]
-    if "error" in call:
-        print("verify_file -> JSON-RPC error:", json.dumps(call["error"])[:200])
-    else:
-        text = call["result"]["content"][0]["text"]
-        print("verify_file (unexpected, not whitelisted):", text[:120])
+        print("=" * 70)
+        print("A) DEFAULT MODE (no HONESTCODE_TOOLS) — expect scan_file + verify_file")
+        print("=" * 70)
+        resp = session(None, [{"name": "verify_file", "arguments": {"file_path": str(broken)}}])
+        init = resp[0].get("result", {})
+        print("serverInfo:", json.dumps(init.get("serverInfo", {})))
+        print("protocolVersion:", init.get("protocolVersion"))
+        tool_names = {t["name"] for t in resp[1].get("result", {}).get("tools", [])}
+        print("tools exposed:", sorted(tool_names))
+        if tool_names != {"scan_file", "verify_file"}:
+            failures.append(f"default tool set is {sorted(tool_names)}")
+        payload = _payload(resp[2])
+        print(
+            "verify_file ->",
+            payload.get("status"),
+            [(f["kind"], f.get("symbol")) for f in payload.get("findings", [])],
+        )
+        if payload.get("status") != "fail" or not any(
+            f.get("symbol") == "refresh_token" for f in payload.get("findings", [])
+        ):
+            failures.append("verify_file did not catch refresh_token in default mode")
 
-    print()
-    print("=" * 70)
-    print("B) FULL MODE (HONESTCODE_TOOLS=all) — call scan_file + verify_file")
-    print("=" * 70)
-    calls = [
-        {"name": "scan_file", "arguments": {"file_path": str(broken)}},
-        {"name": "verify_file", "arguments": {"file_path": str(broken)}},
-        {"name": "search_code", "arguments": {"pattern": "refresh"}},
-    ]
-    resp = session({"HONESTCODE_TOOLS": "all"}, calls)
-    tools = resp[1].get("result", {}).get("tools", [])
-    print(f"tools exposed ({len(tools)}):", sorted(t["name"] for t in tools))
-    for r in resp[2:]:
-        res = r.get("result", r.get("error"))
-        if isinstance(res, dict) and "content" in res:
-            payload = json.loads(res["content"][0]["text"])
+        print()
+        print("=" * 70)
+        print("B) FULL MODE (HONESTCODE_TOOLS=all) — scan_file + verify_file + search_code")
+        print("=" * 70)
+        calls = [
+            {"name": "verify_file", "arguments": {"file_path": str(broken)}},
+            {"name": "scan_file", "arguments": {"file_path": str(broken)}},
+            {"name": "search_code", "arguments": {"pattern": "refresh"}},
+        ]
+        resp = session({"HONESTCODE_TOOLS": "all"}, calls)
+        tool_names = {t["name"] for t in resp[1].get("result", {}).get("tools", [])}
+        print(f"tools exposed ({len(tool_names)}):", sorted(tool_names))
+        if not {"scan_file", "verify_file", "search_code"} <= tool_names:
+            failures.append("full mode is missing a core tool")
+        for response in resp[2:]:
+            payload = _payload(response)
             summary = {
-                k: payload.get(k)
-                for k in ("status", "success", "count", "engine", "error")
-                if k in payload
+                key: payload.get(key)
+                for key in ("status", "success", "count", "engine", "error")
+                if key in payload
             }
-            if "findings" in payload:
-                summary["findings"] = [
-                    {"kind": f["kind"], "symbol": f.get("symbol")} for f in payload["findings"]
-                ]
-            if "issues" in payload:
-                summary["issues"] = [i.get("name") for i in payload["issues"]]
             print(" ->", json.dumps(summary)[:300])
-        else:
-            print(" -> error:", json.dumps(res)[:200])
+        if _payload(resp[2]).get("status") != "fail":
+            failures.append("full-mode verify_file did not fail the broken file")
+        if _payload(resp[4]).get("count", 0) < 1:
+            failures.append("search_code returned no matches")
+
+    if failures:
+        print("\nE2E FAIL:")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+    print("\nE2E PASS")
     return 0
 
 

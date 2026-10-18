@@ -50,9 +50,17 @@ def run(project: Path) -> dict:
 
     files = sorted(p for p in project.rglob("*.py") if "__pycache__" not in p.parts)
     findings: list[dict] = []
+    errors: list[dict] = []
     started = time.perf_counter()
     for p in files:
         report = verify_file(str(p))
+        if not report.get("success", True):
+            # A crashed verification is not a clean file; silently treating it
+            # as zero findings would let this benchmark pass without scanning.
+            errors.append(
+                {"file": str(p.relative_to(project)), "error": report.get("error", "failed")}
+            )
+            continue
         for f in report.get("findings", []):
             findings.append({"file": str(p.relative_to(project)), **f})
     elapsed = time.perf_counter() - started
@@ -61,6 +69,7 @@ def run(project: Path) -> dict:
         "project": str(project),
         "files": len(files),
         "findings": findings,
+        "errors": errors,
         "count": len(findings),
         "elapsed_seconds": round(elapsed, 2),
         "ms_per_file": round(elapsed / len(files) * 1000, 1) if files else 0.0,
@@ -103,13 +112,22 @@ def main() -> int:
         )
         for f in result["findings"]:
             print(f"  [{f['kind']}/{f['confidence']}] {f['file']}:{f['line']} {f['message']}")
-        if result["count"] == 0:
+        for e in result["errors"]:
+            print(f"  [error] {e['file']}: {e['error']}")
+        if result["files"] == 0:
+            print("\nFAIL: no Python files were scanned (wrong --project?).")
+        elif result["errors"]:
+            print(f"\nFAIL: {len(result['errors'])} file(s) could not be verified.")
+        elif result["count"] == 0:
             print("\nPASS: no false positives on real-world code.")
         else:
             print(f"\nFAIL: {result['count']} finding(s) on code that should be clean.")
 
-    # Any finding on this corpus is a false positive: block the build.
-    return 2 if result["count"] else 0
+    # Any finding (or a failed scan) on this corpus is a false positive:
+    # block the build. An empty scan is a broken invocation, not a pass.
+    if result["files"] == 0 or result["errors"] or result["count"]:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

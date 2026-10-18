@@ -64,6 +64,11 @@ def run_demo() -> str:
         env=env,
         encoding="utf-8",
     )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"demo run.py failed (exit {result.returncode}); refusing to render a GIF "
+            f"of a failing demo.\n{result.stderr[-2000:]}"
+        )
     return result.stdout
 
 
@@ -75,7 +80,9 @@ def shorten_output(text: str) -> list[str]:
     return [line.rstrip() for line in text.splitlines()]
 
 
-def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> tuple[int, int]:
+def text_size(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont
+) -> tuple[int, int]:
     bbox = draw.textbbox((0, 0), text, font=font)
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
@@ -153,7 +160,9 @@ def main() -> int:
         )
 
     # Command committed, no cursor.
-    add_frames(frames, make_frame(font, prompt_width, output_lines, 0, command, None, False), count=4)
+    add_frames(
+        frames, make_frame(font, prompt_width, output_lines, 0, command, None, False), count=4
+    )
 
     # Output scrolls in.
     for visible in range(1, len(output_lines) + 1):

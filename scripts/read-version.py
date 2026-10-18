@@ -1,24 +1,25 @@
-"""Print the project version from pyproject.toml (single source of truth).
+"""Print the project version from honestcode/__init__.py.
+
+``pyproject.toml`` declares the version dynamically from that attribute, so
+there is exactly one place to bump.
 
 Usage: python scripts/read-version.py
 """
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
-    import tomli as tomllib  # type: ignore[no-redef]
-
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def main() -> None:
-    with (ROOT / "pyproject.toml").open("rb") as fh:
-        pyproject = tomllib.load(fh)
-    print(pyproject["project"]["version"])
+    from honestcode import __version__
+
+    print(__version__)
 
 
 if __name__ == "__main__":

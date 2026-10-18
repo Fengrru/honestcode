@@ -36,6 +36,9 @@ _FALLBACK_DIST_TO_IMPORT: dict[str, str] = {
     "gitpython": "git",
     "pyserial": "serial",
     "msgpack-python": "msgpack",
+    # The slim distribution and its import name differ by a hyphen.
+    "pydantic-ai-slim": "pydantic_ai",
+    "pydantic-ai": "pydantic_ai",
 }
 
 _import_to_distributions: dict[str, list[str]] | None = None

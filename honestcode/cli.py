@@ -26,6 +26,7 @@ import argparse
 import json
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from honestcode.honest import project_binding as _binding
@@ -53,15 +54,44 @@ def _emit_issues(result: dict[str, Any], issue_key: str = "issues") -> int:
     return 1 if n else 0
 
 
+def _ensure_index(args: argparse.Namespace) -> None:
+    """Load the project index for a fresh CLI process.
+
+    Every command runs in its own process, so an index built by an earlier
+    ``honestcode index`` call is not in memory. Resolve the project from
+    ``--root`` (nearest ``.git`` / ``.honestcode``) and build/reuse the cached
+    index before any query that needs it.
+    """
+    explicit = getattr(args, "root", None)
+    if explicit is None and _tools._project_root is not None:
+        # Same-process usage (tests, embedded callers): the caller already
+        # chose a project; revalidate it instead of silently switching to cwd.
+        _tools.index_project(str(_tools._project_root))
+        return
+    if explicit is not None:
+        # An explicit --root is authoritative: do not walk up to an enclosing
+        # git repository and index projects the caller did not name.
+        start = Path(explicit)
+        if start.is_file():
+            start = start.parent
+        root = start
+    else:
+        start = Path.cwd()
+        root = _binding.find_project_root(str(start)) or start
+    _tools.index_project(str(root))
+
+
 def _cmd_index(args: argparse.Namespace) -> int:
     return _emit(_tools.index_project(args.path, force_rebuild=args.force, watch=args.watch))
 
 
 def _cmd_affected(args: argparse.Namespace) -> int:
+    _ensure_index(args)
     return _emit(_tools.affected_files(base=args.base, head=args.head, max_depth=args.depth))
 
 
 def _cmd_impact(args: argparse.Namespace) -> int:
+    _ensure_index(args)
     return _emit(_tools.explore_impact(args.symbol, max_depth=args.depth))
 
 
@@ -132,6 +162,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 
 def _cmd_check_symbol(args: argparse.Namespace) -> int:
+    _ensure_index(args)
     res = _tools.check_symbol(args.symbol, file_path=args.file or None)
     _emit(res)
     return 0 if res.get("defined") else 1
@@ -152,6 +183,7 @@ def _cmd_execute(args: argparse.Namespace) -> int:
 
 
 def _cmd_dead_code(args: argparse.Namespace) -> int:
+    _ensure_index(args)
     return _emit_issues(
         _tools.find_dead_code(
             entrypoints=args.entrypoints,
@@ -163,14 +195,17 @@ def _cmd_dead_code(args: argparse.Namespace) -> int:
 
 
 def _cmd_similar(args: argparse.Namespace) -> int:
+    _ensure_index(args)
     return _emit_issues(_tools.find_similar_code(threshold=args.threshold), issue_key="pairs")
 
 
 def _cmd_call_graph(args: argparse.Namespace) -> int:
+    _ensure_index(args)
     return _emit(_tools.explore_call_graph(args.symbol))
 
 
 def _cmd_search(args: argparse.Namespace) -> int:
+    _ensure_index(args)
     return _emit_issues(_tools.search_code(args.pattern, glob=args.glob), issue_key="matches")
 
 
@@ -179,6 +214,7 @@ def _cmd_load_package(args: argparse.Namespace) -> int:
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
+    _ensure_index(args)
     return _emit(_tools.get_project_stats())
 
 
@@ -195,6 +231,14 @@ def _version_string() -> str:
         from honestcode import __version__
 
         return f"honestcode {__version__}"
+
+
+def _add_root_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--root",
+        default=None,
+        help="Project root (default: cwd, or the nearest .git/.honestcode).",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -243,7 +287,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("check-symbol", help="Check whether a symbol is defined in the project.")
     p.add_argument("symbol", help="Module-qualified symbol name, e.g. pkg.core.helper.")
-    p.add_argument("--file", default="", help="Optional file the symbol appears in.")
+    p.add_argument("--file", default="", help="Require the symbol to be defined in this file.")
+    _add_root_arg(p)
     p.set_defaults(func=_cmd_check_symbol)
 
     p = sub.add_parser("check-api", help="Verify a library API call exists.")
@@ -287,6 +332,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Do not treat symbols in test files as alive.",
     )
+    _add_root_arg(p)
     p.set_defaults(func=_cmd_dead_code, include_tests=True)
 
     p = sub.add_parser("similar", help="Find function-level code clones across the project.")
@@ -296,15 +342,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.85,
         help="Similarity ratio above which two functions are reported (0-1).",
     )
+    _add_root_arg(p)
     p.set_defaults(func=_cmd_similar)
 
     p = sub.add_parser("call-graph", help="Explore callers and callees of a symbol.")
     p.add_argument("symbol", help="Symbol name to explore.")
+    _add_root_arg(p)
     p.set_defaults(func=_cmd_call_graph)
 
     p = sub.add_parser("impact", help="Compute the blast radius of a symbol.")
     p.add_argument("symbol", help="Symbol name to analyze.")
     p.add_argument("--depth", type=int, default=3, help="Max call-graph hops (default: 3).")
+    _add_root_arg(p)
     p.set_defaults(func=_cmd_impact)
 
     p = sub.add_parser(
@@ -314,11 +363,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base", default="HEAD", help="Git ref to diff against (default: HEAD).")
     p.add_argument("--head", default=None, help="Optional second ref for base..head diffs.")
     p.add_argument("--depth", type=int, default=4, help="Max call-graph hops (default: 4).")
+    _add_root_arg(p)
     p.set_defaults(func=_cmd_affected)
 
     p = sub.add_parser("search", help="Search project source code with a regex pattern.")
     p.add_argument("pattern", help="Regular expression to search for.")
     p.add_argument("--glob", default="*.py", help="Glob pattern for files to search.")
+    _add_root_arg(p)
     p.set_defaults(func=_cmd_search)
 
     p = sub.add_parser("load-package", help="Load API signatures for a specific package.")
@@ -326,6 +377,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=_cmd_load_package)
 
     p = sub.add_parser("stats", help="Show statistics about the indexed project.")
+    _add_root_arg(p)
     p.set_defaults(func=_cmd_stats)
 
     p = sub.add_parser("choose-tool", help="Show which tool a natural-language query maps to.")

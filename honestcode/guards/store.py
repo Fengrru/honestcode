@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS side_effects (
     payload_hash    TEXT NOT NULL DEFAULT '',
     preconditions   TEXT NOT NULL DEFAULT '[]',
     status          TEXT NOT NULL,
+    scope           TEXT,
     response_hash   TEXT,
     compensation    TEXT,
     created_at      INTEGER NOT NULL,
@@ -117,6 +118,10 @@ class EffectRecord:
     payload_hash: str
     preconditions: tuple[str, ...]
     status: EffectStatus
+    #: The durable scope the caller supplied, if any. Scoped records live in a
+    #: namespace derived from this value; keeping it on the row is what lets
+    #: recovery query the records for a run id after a restart.
+    scope: str | None = None
     response_hash: str | None = None
     compensation: dict[str, Any] | None = None
     created_at: int = 0
@@ -146,6 +151,8 @@ class EffectRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.scope is not None:
+            out["scope"] = self.scope
         if self.response_hash is not None:
             out["response_hash"] = self.response_hash
         if self.committed_at is not None:
@@ -170,6 +177,7 @@ def _row_to_record(row: sqlite3.Row) -> EffectRecord:
         payload_hash=row["payload_hash"],
         preconditions=tuple(json.loads(row["preconditions"])),
         status=EffectStatus(row["status"]),
+        scope=row["scope"],
         response_hash=row["response_hash"],
         compensation=json.loads(row["compensation"]) if row["compensation"] else None,
         created_at=int(row["created_at"]),
@@ -202,6 +210,15 @@ class EffectStore:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
+            # Databases created before scope was persisted get the column added
+            # in place; the index is created after the migration because an old
+            # table has no scope column for it to reference.
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(side_effects)")}
+            if "scope" not in columns:
+                self._conn.execute("ALTER TABLE side_effects ADD COLUMN scope TEXT")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_side_effects_scope ON side_effects (scope)"
+            )
         except sqlite3.Error as exc:  # pragma: no cover - environment dependent
             raise StoreError(f"cannot open effect store at {self.path}: {exc}") from exc
 
@@ -229,6 +246,7 @@ class EffectStore:
         payload_hash: str,
         preconditions: tuple[str, ...],
         status: EffectStatus = PENDING,
+        scope: str | None = None,
     ) -> EffectRecord | None:
         """Insert a new record, or return ``None`` if the key already exists.
 
@@ -244,9 +262,9 @@ class EffectStore:
                     """
                     INSERT INTO side_effects (
                         effect_id, session_id, idempotency_key, action_type, target,
-                        effect_class, payload_hash, preconditions, status,
+                        effect_class, payload_hash, preconditions, status, scope,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         effect_id,
@@ -258,6 +276,7 @@ class EffectStore:
                         payload_hash,
                         json.dumps(list(preconditions)),
                         str(status),
+                        scope,
                         now,
                         now,
                     ),
@@ -297,6 +316,33 @@ class EffectStore:
             raise StoreError(f"no such effect: {effect_id}")
         return record
 
+    def transition_if_status(
+        self,
+        effect_id: str,
+        allowed: tuple[EffectStatus, ...],
+        status: EffectStatus,
+    ) -> bool:
+        """Atomically advance a record only while it is in one of *allowed*.
+
+        The read-then-write form this replaces let two concurrent retries of a
+        FAILED effect both observe ``failed`` and both go on to execute the
+        effect. Returns ``True`` only for the caller that actually performed the
+        transition; everyone else gets ``False`` and must adopt or refuse.
+        """
+        if status not in _ALL_STATUSES:
+            raise StoreError(f"unknown status: {status!r}")
+        allowed_values = tuple(str(s) for s in allowed)
+        if not allowed_values:
+            return False
+        placeholders = ", ".join("?" for _ in allowed_values)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE side_effects SET status = ?, updated_at = ? "
+                f"WHERE effect_id = ? AND status IN ({placeholders})",
+                (str(status), _now_millis(), effect_id, *allowed_values),
+            )
+            return cur.rowcount == 1
+
     def set_compensation(self, effect_id: str, data: dict[str, Any]) -> EffectRecord:
         """Attach the information needed to undo a reversible effect."""
         with self._lock:
@@ -334,6 +380,7 @@ class EffectStore:
         *,
         session_id: str | None = None,
         status: EffectStatus | None = None,
+        scope: str | None = None,
         limit: int = 1000,
     ) -> list[EffectRecord]:
         clauses, params = [], []
@@ -343,6 +390,12 @@ class EffectStore:
         if status is not None:
             clauses.append("status = ?")
             params.append(str(status))
+        if scope is not None:
+            # Scoped records live under a namespace session id, so filtering by
+            # the caller's session missed them entirely; scope is the column
+            # that survives a restart and identifies the run they belong to.
+            clauses.append("scope = ?")
+            params.append(scope)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         with self._lock:
@@ -352,18 +405,25 @@ class EffectStore:
             ).fetchall()
         return [_row_to_record(r) for r in rows]
 
-    def unresolved(self, session_id: str | None = None) -> list[EffectRecord]:
+    def unresolved(
+        self, session_id: str | None = None, *, scope: str | None = None
+    ) -> list[EffectRecord]:
         """Records whose outcome is *unknown* — the crash-recovery queue.
 
         These are the effects an agent must resolve before doing anything else,
         because for each of them the outside world may or may not have already
-        been changed.
+        been changed. Pass *scope* to ask the cross-restart question for one
+        durable run id; the scoped record's session id is a derived namespace
+        and cannot be supplied by the caller.
         """
         clauses = ["status IN (?, ?)"]
         params: list[Any] = [str(EXECUTING), str(PENDING)]
         if session_id is not None:
             clauses.append("session_id = ?")
             params.append(session_id)
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT * FROM side_effects WHERE {' AND '.join(clauses)} "  # noqa: S608
@@ -372,11 +432,20 @@ class EffectStore:
             ).fetchall()
         return [_row_to_record(r) for r in rows]
 
-    def count_by_status(self, session_id: str | None = None) -> dict[str, int]:
-        clause, params = ("WHERE session_id = ?", [session_id]) if session_id else ("", [])
+    def count_by_status(
+        self, session_id: str | None = None, *, scope: str | None = None
+    ) -> dict[str, int]:
+        clauses, params = [], []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT status, COUNT(*) AS n FROM side_effects {clause} GROUP BY status",  # noqa: S608
+                f"SELECT status, COUNT(*) AS n FROM side_effects {where} GROUP BY status",  # noqa: S608
                 params,
             ).fetchall()
         return {str(r["status"]): int(r["n"]) for r in rows}

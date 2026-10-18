@@ -18,9 +18,11 @@ python benchmarks/value_drift/run.py --json     # machine-readable
 python benchmarks/value_drift/run.py --verify   # corpus self-check
 ```
 
-Exit code is 2 if the guarded matcher drifts outside the region the caller
-named, or if the corpus is inconsistent — the same contract the other
-benchmarks use to gate CI.
+Exit code is 2 if the guarded matcher does not produce the intended edit on
+every scenario (drift, a wrong span, or a refusal), or if the corpus is
+inconsistent — the same contract the other benchmarks use to gate CI. A refusal
+is safe over verbose, but in CI it is not a pass: an over-strict matcher that
+refuses every edit would otherwise hide a recall regression.
 
 ## Method
 
@@ -40,12 +42,18 @@ string. Two failure modes are distinguished, and they are not equally bad:
 distinguishes it from a correct edit, so it cannot be recovered from without
 reading the file afterwards.
 
-`strategies.py` carries a faithful Python port of all eight `fuzzy-patch`
-strategies **including** its value guard, the same eight with the guard removed,
-and a matcher in the shape the ecosystem converged on (similarity floor +
-uniqueness + disproportionate-span rejection). The guarded and unguarded sets
-differ in exactly one thing, so any difference in outcome is attributable to the
-guard.
+`strategies.py` carries a Python port of all eight `fuzzy-patch` strategies
+**including** its value guard, the same eight with the guard removed, and a
+matcher in the shape the ecosystem converged on (similarity floor + uniqueness +
+disproportionate-span rejection). The guarded and unguarded sets differ in
+exactly one thing, so any difference in outcome is attributable to the guard.
+
+One adaptation is deliberate: `token_match` now extends its word-token span
+through the closing brackets it opened. Without that, a re-chunked multi-line
+call matched `return client.get(..., timeout=30` but not the trailing `)`, and
+splicing a one-line replacement into it produced unbalanced code. The extension
+is covered by the benchmark's own scenarios and by
+`tests/test_value_drift.py::test_a_partial_interior_match_is_wrong_span`.
 
 Two corpus invariants make the results meaningful, and `--verify` enforces them:
 
@@ -116,26 +124,13 @@ where search strings are not hand-authored to be solvable, and the measured
 quantity is how often the guard's refusals turn a would-be drift into a safe
 `no_match`.
 
-## A second copy of these episodes
-
-The same ten episodes also run as Bun tests alongside the matcher they exercise,
-where the regression belongs: they are what the matcher has to keep passing, and
-that suite carries a self-test proving its detector can tell a correct edit from
-a drifting one.
-
-What this copy keeps and that one does not is the **comparison**.
-`strategies.py` carries a conservative competitor matcher (similarity floor +
-uniqueness), which is the shape the 2026 edit-application ecosystem converged on.
-It refused nine of the ten, and reproducing that is why two copies exist rather
-than one.
-
-If the episodes change, change both. The `SCENARIOS` table is the same data and
-the two are meant to stay in step.
-
 ## Provenance
 
-`strategies.py` is a behaviour-preserving port of the matcher this corpus was
-built to test, including the values-normalisation used by its value guard. It is
-a port rather than a reimplementation on purpose: the comparison only means
-something if the matcher measured is the matcher in use. If that implementation
-changes, this port has to change with it or the numbers stop describing it.
+`strategies.py` is a Python port of the external `fuzzy-patch` matcher this
+corpus was built to test, including the values-normalisation used by its value
+guard. It is a port rather than a reimplementation on purpose: the comparison
+only means something if the matcher measured is the matcher in use. If that
+implementation changes, this port has to change with it or the numbers stop
+describing it. The external repository is not vendored here, so the port cannot
+be diffed automatically; the corpus and the guarded/unguarded comparison are the
+executable specification this repository owns.

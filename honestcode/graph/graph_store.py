@@ -2,10 +2,13 @@
 
 ``GraphCache`` persists the project-wide call graph (definitions + references)
 to a SQLite database keyed by a stable hash of the project root. Freshness is
-decided by comparing stored SHA-256 hashes of every ``.py`` file against the
-current tree, so graph queries (``explore_call_graph``, ``find_dead_code``,
-``impact``, ``affected``) read from disk instead of re-parsing the project on
-every call.
+decided by comparing stored ``(mtime_ns, size)`` metadata for every ``.py``
+file against the current tree, so graph queries (``explore_call_graph``,
+``find_dead_code``, ``impact``, ``affected``) read from disk instead of
+re-parsing the project on every call. Metadata rather than content hashing:
+hashing the whole tree on every query made the read-only graph tools pay a
+full-tree read, and the same-file-rewritten-within-one-mtime-tick case it would
+catch is not worth that cost.
 
 The same database hosts a FTS5 virtual table (trigram tokenizer) over file
 contents. ``search_code`` uses it to shrink a regex scan to a *superset* of
@@ -25,11 +28,18 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from honestcode.structure.utils import iter_python_files, prune_cache_files, read_python_source
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["CallGraph", "GraphCache"]
 
-_DB_VERSION = 1
+# v2 replaced whole-tree content hashes with (mtime_ns, size) metadata.
+_DB_VERSION = 2
+
+# ``<root name>_<16 hex chars>.graph.db`` — narrow on purpose so pruning a
+# user-supplied cache directory cannot delete unrelated SQLite files.
+_GRAPH_CACHE_GLOB = "*_" + "[0-9a-f]" * 16 + ".graph.db"
 
 
 @dataclass
@@ -46,20 +56,19 @@ class CallGraph:
 
 
 def _python_files(root: Path) -> list[Path]:
-    return sorted(
-        p for p in root.rglob("*.py") if not p.name.startswith(".") and "__pycache__" not in p.parts
-    )
+    return list(iter_python_files(root))
 
 
-def _file_hashes(root: Path) -> dict[str, str]:
-    """Map each relative .py path to a SHA-256 of its bytes."""
-    hashes: dict[str, str] = {}
+def _file_stats(root: Path) -> dict[str, list[int]]:
+    """Map each relative .py path to ``[mtime_ns, size]``."""
+    stats: dict[str, list[int]] = {}
     for p in _python_files(root):
         try:
-            hashes[str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
+            st = p.stat()
         except OSError:
             continue
-    return hashes
+        stats[p.relative_to(root).as_posix()] = [st.st_mtime_ns, st.st_size]
+    return stats
 
 
 def _stable_hash(text: str) -> str:
@@ -88,14 +97,17 @@ class GraphCache:
         try:
             conn = sqlite3.connect(str(self.path))
             cur = conn.cursor()
-            row = cur.execute("SELECT value FROM meta WHERE key='hashes'").fetchone()
+            row = cur.execute("SELECT value FROM meta WHERE key='stats'").fetchone()
             root_row = cur.execute("SELECT value FROM meta WHERE key='root'").fetchone()
+            version_row = cur.execute("SELECT value FROM meta WHERE key='version'").fetchone()
         except sqlite3.Error:
             return False
         finally:
             if conn is not None:
                 conn.close()
-        if row is None or root_row is None:
+        if row is None or root_row is None or version_row is None:
+            return False
+        if version_row[0] != str(_DB_VERSION):
             return False
         if root_row[0] != str(root.resolve()):
             return False
@@ -103,15 +115,15 @@ class GraphCache:
             stored = json.loads(row[0])
         except (json.JSONDecodeError, TypeError):
             return False
-        return stored == _file_hashes(root)
+        return stored == _file_stats(root)
 
     # -- persistence -------------------------------------------------------
 
     def save(self, graph: CallGraph, root: Path) -> None:
         """Persist the graph plus a FTS5 index of the current file tree."""
         root = root.resolve()
-        hashes = _file_hashes(root)
-        files = sorted(hashes.keys())
+        stats = _file_stats(root)
+        files = sorted(stats.keys())
         conn = sqlite3.connect(str(self.path))
         try:
             conn.execute("DROP TABLE IF EXISTS definitions")
@@ -150,13 +162,14 @@ class GraphCache:
                     ("version", str(_DB_VERSION)),
                     ("root", str(root)),
                     ("files", json.dumps(files)),
-                    ("hashes", json.dumps(hashes)),
+                    ("stats", json.dumps(stats)),
                 ],
             )
             conn.commit()
             self._rebuild_fts(conn, root, files)
         finally:
             conn.close()
+        prune_cache_files(self.path.parent, (_GRAPH_CACHE_GLOB,))
 
     def load(self) -> CallGraph | None:
         """Load the graph from disk, or ``None`` if missing/corrupt."""
@@ -194,10 +207,8 @@ class GraphCache:
             logger.debug("FTS5 unavailable; search_code will fall back to regex scans")
             return
         for rel in files:
-            path = root / rel
-            try:
-                content = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+            content = read_python_source(root / rel)
+            if content is None:
                 continue
             conn.execute("INSERT INTO fts_files (path, content) VALUES (?, ?)", (rel, content))
         conn.commit()

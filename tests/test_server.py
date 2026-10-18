@@ -32,12 +32,12 @@ def sample_project(tmp_path: Path):
 
 
 # ── Tool registry / whitelist ──────────────────────────────────────────
-def test_default_whitelist_is_scan_file_only():
+def test_default_whitelist_exposes_the_two_verification_tools():
     # Simulate an unset env var.
     old = os.environ.pop("HONESTCODE_TOOLS", None)
     try:
         wl = server_mod._resolve_tool_whitelist()
-        assert wl == {"scan_file"}
+        assert wl == {"scan_file", "verify_file"}
     finally:
         if old is not None:
             os.environ["HONESTCODE_TOOLS"] = old

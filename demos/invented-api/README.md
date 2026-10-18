@@ -41,9 +41,10 @@ Agent fixes the code...
 ## Record the GIF
 
 The checked-in `demo.gif` was generated with Pillow so it does not require
-`ttyd`/`ffmpeg`. To regenerate it:
+`ttyd`/`ffmpeg`. Pillow is not a package dependency; install it first:
 
 ```bash
+python -m pip install Pillow
 python render_gif.py
 ```
 

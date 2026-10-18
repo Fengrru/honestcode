@@ -32,6 +32,9 @@ def run() -> int:
     report = verify_file(str(broken))
     print(report["text"])
     print()
+    detected = report.get("status") == "fail" and any(
+        finding.get("symbol") == "refresh_token" for finding in report.get("findings", [])
+    )
 
     print("=" * 60)
     print("Agent fixes the code...")
@@ -39,7 +42,10 @@ def run() -> int:
     fixed = here / "app" / "login_fixed.py"
     report = verify_file(str(fixed))
     print(report["text"])
-    return 0 if report["status"] == "pass" else 1
+    # The demo is a regression test of the advertised flow: it must catch the
+    # invented API and it must pass the fixed file. Only checking the second
+    # half let a detector regression exit 0 with a broken demo.
+    return 0 if detected and report.get("status") == "pass" else 1
 
 
 if __name__ == "__main__":

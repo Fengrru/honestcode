@@ -8,14 +8,20 @@ verify generated code against the real project structure and dependencies.
 Run with:
     python -m honestcode.mcp.server            # stdio (default)
     python -m honestcode.mcp.server --sse       # SSE transport
-    python -m honestcode.mcp.server --sse --host 0.0.0.0 --port 8000
 
 Tool visibility is controlled by the ``HONESTCODE_TOOLS`` environment variable.
-By default only ``scan_file`` is exposed; set ``HONESTCODE_TOOLS`` to a
-comma-separated list of tool names (or ``all``) to expose more:
+By default ``scan_file`` and ``verify_file`` are exposed; set
+``HONESTCODE_TOOLS`` to a comma-separated list of tool names (or ``all``) to
+expose more:
 
     export HONESTCODE_TOOLS=index,check_symbol,check_api,validate_types
     export HONESTCODE_TOOLS=all
+
+The SSE transport has no authentication and the sandbox is an accident guard,
+not a containment boundary. Binding it to a non-loopback address therefore
+requires an explicit opt-in (``HONESTCODE_ALLOW_NETWORK=1``) and should be
+fronted by a real access-control layer; a remote caller with ``execute_code``
+can run code as the current user.
 """
 
 from __future__ import annotations
@@ -237,21 +243,23 @@ _ALL_TOOLS: dict[str, tuple[Callable, str]] = {
     "choose_tool": (_mcp_choose_tool, "Map a query to the best tool."),
 }
 
-# ``scan_file`` is always exposed; the remaining tools are opt-in.
+# ``scan_file`` is always exposed; ``verify_file`` is the agent-facing tool and
+# is part of the default surface. The remaining tools are opt-in.
 _PRIMARY_TOOL = "scan_file"
+_DEFAULT_TOOLS = frozenset({"scan_file", "verify_file"})
 
 
 def _resolve_tool_whitelist() -> set[str]:
     """Resolve which tool names to expose on this server.
 
-    Reads ``HONESTCODE_TOOLS``. If unset, only the primary tool
-    (``scan_file``) is exposed. ``all`` exposes every tool. Otherwise the
-    value is treated as a comma-separated list of names; unknown names are
-    ignored with a warning.
+    Reads ``HONESTCODE_TOOLS``. If unset, the two verification tools
+    (``scan_file`` and ``verify_file``) are exposed. ``all`` exposes every
+    tool. Otherwise the value is treated as a comma-separated list of names;
+    unknown names are ignored with a warning.
     """
     raw = os.environ.get("HONESTCODE_TOOLS", "").strip()
     if not raw:
-        return {_PRIMARY_TOOL}
+        return set(_DEFAULT_TOOLS)
 
     if raw.lower() == "all":
         return set(_ALL_TOOLS.keys())
@@ -284,6 +292,26 @@ def _register_tools() -> None:
     mcp._registered_tool_names = already  # type: ignore[attr-defined]
 
 
+def register_tools() -> None:
+    """Public entry point for registering the whitelisted tools.
+
+    ``scripts/run_mcp_server.py`` imports the FastMCP object directly; without
+    this call it used to start a server with an empty tool registry.
+    """
+    _register_tools()
+
+
+def _is_loopback(host: str) -> bool:
+    if host in {"localhost", "::1"}:
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="honestcode-mcp",
@@ -299,7 +327,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=8000, help="SSE port (default: 8000).")
     args = parser.parse_args(argv)
 
-    _register_tools()
+    if (
+        args.transport == "sse"
+        and not _is_loopback(args.host)
+        and os.environ.get("HONESTCODE_ALLOW_NETWORK") != "1"
+    ):
+        logger.error(
+            "Refusing to expose the unauthenticated MCP server on non-loopback host %s. "
+            "Set HONESTCODE_ALLOW_NETWORK=1 only behind a real access-control layer.",
+            args.host,
+        )
+        raise SystemExit(2)
+
+    register_tools()
 
     whitelist = _resolve_tool_whitelist()
     logger.info(

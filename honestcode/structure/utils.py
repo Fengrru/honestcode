@@ -6,17 +6,23 @@ import ast
 import importlib
 import importlib.util
 import sys
+import time
+import tokenize
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Iterator
 
 __all__ = [
     "call_base",
     "call_name",
     "importable_root",
+    "iter_python_files",
     "module_name_for",
+    "prune_cache_files",
+    "read_python_source",
     "stdlib_resolves",
     "stdlib_roots",
 ]
@@ -99,6 +105,90 @@ def importable_root(name: str) -> bool:
         return importlib.util.find_spec(name) is not None
     except (ImportError, ValueError, AttributeError, TypeError, OSError):
         return False
+
+
+# Directories that never contain project source worth indexing. Hidden
+# directories (``.venv``, ``.git``, ``.tox``, ...) are skipped by prefix, and the
+# named ones below cover the common non-hidden artifact trees. Without this,
+# following the README's own development setup (``python -m venv .venv``) made
+# every scan index the entire virtual environment.
+_SKIP_DIR_NAMES = frozenset(
+    {
+        "__pycache__",
+        "node_modules",
+        "site-packages",
+        "dist-packages",
+        "venv",
+        "build",
+        "dist",
+        "htmlcov",
+    }
+)
+
+
+def _is_skipped_part(part: str) -> bool:
+    return part.startswith(".") or part in _SKIP_DIR_NAMES or part.endswith(".egg-info")
+
+
+def iter_python_files(root: Path | str) -> Iterator[Path]:
+    """Yield every indexable ``.py`` file under *root*, sorted by path.
+
+    Skips hidden directories (which covers ``.venv``/``.git``/``.tox`` and the
+    other tool caches), virtual environments and build artifacts. This is the
+    single traversal used by the symbol index, the call graph, the watcher and
+    the MCP tools so their notions of "the project's files" cannot drift apart.
+    """
+    root = Path(root)
+    for path in sorted(root.rglob("*.py")):
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        if any(_is_skipped_part(part) for part in rel.parts[:-1]):
+            continue
+        if path.name.startswith(".") or path.name in _SKIP_DIR_NAMES:
+            continue
+        yield path
+
+
+def read_python_source(path: Path | str) -> str | None:
+    """Read Python source honouring its PEP 263 coding declaration.
+
+    ``Path.read_text(encoding="utf-8")`` raises on any legally non-UTF-8 source
+    file, and a single such file used to abort an entire project index build.
+    ``tokenize.open`` decodes exactly what the interpreter itself would, and a
+    genuinely unreadable file returns ``None`` so callers can skip it instead of
+    failing the scan.
+    """
+    try:
+        with tokenize.open(str(path)) as handle:
+            return handle.read()
+    except (OSError, SyntaxError, UnicodeDecodeError, LookupError):
+        return None
+
+
+def prune_cache_files(
+    directory: Path | str, patterns: tuple[str, ...], max_age_days: int = 30
+) -> None:
+    """Delete cache files matching *patterns* that have not been touched recently.
+
+    Symbol/graph caches are stored one file per project root and are entirely
+    regenerable. Without a bound they accumulate one entry per temporary or
+    abandoned project forever. Only genuinely old files are removed, so an
+    active project's cache is never collected; a deletion that loses a race
+    with another process is ignored.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return
+    cutoff = time.time() - max_age_days * 86400
+    for pattern in patterns:
+        for path in directory.glob(pattern):
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
 
 
 def call_name(node: ast.expr) -> str | None:

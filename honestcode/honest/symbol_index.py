@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from honestcode.structure.extractor import StructureExtractor
-from honestcode.structure.utils import module_name_for
+from honestcode.structure.utils import iter_python_files, module_name_for, prune_cache_files
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,11 @@ __all__ = ["SymbolInfo", "SymbolIndex", "ProjectIndex", "get_project_index"]
 # (v2 added file_names/module_symbols for re-export resolution); older cache
 # files are ignored so a stale on-disk index cannot silently degrade results.
 _INDEX_CACHE_VERSION = 2
+
+# The cache file name is ``<root name>_<16 hex chars>.json``; the glob is
+# narrow so pruning a user-supplied cache directory cannot touch unrelated
+# JSON files that happen to live there.
+_INDEX_CACHE_GLOB = "*_" + "[0-9a-f]" * 16 + ".json"
 
 
 @dataclass
@@ -126,11 +131,13 @@ class ProjectIndex:
 
 
 def _iter_py_files(root: Path) -> dict[str, Path]:
-    """Map every indexable .py file (posix rel path) to its absolute path."""
+    """Map every indexable .py file (posix rel path) to its absolute path.
+
+    The shared traversal skips virtual environments, hidden tool directories and
+    build artifacts; see :func:`honestcode.structure.utils.iter_python_files`.
+    """
     files: dict[str, Path] = {}
-    for p in sorted(root.rglob("*.py")):
-        if p.name.startswith(".") or "__pycache__" in p.parts:
-            continue
+    for p in iter_python_files(root):
         try:
             rel = p.relative_to(root).as_posix()
         except ValueError:
@@ -386,6 +393,7 @@ def get_project_index(
             json.dumps(ProjectIndexJSON.dump(idx), indent=2),
             encoding="utf-8",
         )
+        prune_cache_files(cache_dir, (_INDEX_CACHE_GLOB,))
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to write cache %s: %s", cache_path, e)
 

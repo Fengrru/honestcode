@@ -125,20 +125,56 @@ def install_mcp_config(
     }
     written: list[dict] = []
     skipped: list[dict] = []
+    errors: list[dict] = []
 
     for name, locator, label in targets:
         target = Path(locator(root))
         payload: dict = {}
         if target.exists():
             try:
-                payload = json.loads(target.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = {}
+                text = target.read_text(encoding="utf-8")
+            except OSError as exc:
+                errors.append(
+                    {"client": name, "path": label, "error": f"cannot read config: {exc}"}
+                )
+                continue
+            if text.strip():
+                try:
+                    loaded = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    # Never replace a user's config with a fresh object: a
+                    # config carrying comments or a trailing comma is common,
+                    # and silently discarding it loses every unrelated setting.
+                    errors.append(
+                        {
+                            "client": name,
+                            "path": label,
+                            "error": f"refusing to overwrite unparsable JSON: {exc}",
+                        }
+                    )
+                    continue
+                if not isinstance(loaded, dict):
+                    errors.append(
+                        {
+                            "client": name,
+                            "path": label,
+                            "error": "config root is not a JSON object",
+                        }
+                    )
+                    continue
+                payload = loaded
         # Cursor and Claude Code store servers under "mcpServers";
         # VS Code uses "servers".
         key = "mcpServers" if name in ("claude", "cursor") else "servers"
         servers = payload.setdefault(key, {})
-        servers["honestcode"] = entry
+        if not isinstance(servers, dict):
+            errors.append({"client": name, "path": label, "error": f'"{key}" is not a JSON object'})
+            continue
+        item = dict(entry)
+        if name == "vscode":
+            # VS Code's server entries declare their transport explicitly.
+            item["type"] = "stdio"
+        servers["honestcode"] = item
         if dry_run:
             skipped.append({"client": name, "path": label, "would_write": True})
             continue
@@ -146,12 +182,19 @@ def install_mcp_config(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         except OSError as exc:
-            return {"success": False, "error": f"Cannot write {label}: {exc}"}
+            errors.append({"client": name, "path": label, "error": f"cannot write: {exc}"})
+            continue
         written.append({"client": name, "path": label})
 
-    result: dict = {"success": True, "dry_run": dry_run, "command": launch}
+    result: dict = {
+        "success": not errors,
+        "dry_run": dry_run,
+        "command": launch,
+    }
     if written:
         result["written"] = written
     if skipped:
         result["skipped"] = skipped
+    if errors:
+        result["errors"] = errors
     return result

@@ -282,6 +282,55 @@ def strategy_context_anchor(content: str, old: str) -> MatchResult | None:
     return None
 
 
+_OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
+_CLOSERS = frozenset(_OPEN_TO_CLOSE.values())
+
+
+def _bracket_balanced_end(content: str, start: int, end: int) -> int:
+    """Extend a word-token span through its closing brackets.
+
+    ``token_match`` stops at the last word token, so for a multi-line call it
+    matched ``return client.get(..., timeout=30`` and left the trailing
+    ``\\n    )`` outside the span. Replacing that span with the (balanced)
+    replacement duplicated the closing paren and produced invalid code. Walk
+    the existing span with a small bracket/quote scanner and keep consuming
+    until every bracket it opened is closed.
+    """
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+
+    def consume(
+        ch: str, stack: list[str], quote: str | None, escaped: bool
+    ) -> tuple[str | None, bool]:
+        if quote is not None:
+            if escaped:
+                return quote, False
+            if ch == "\\":
+                return quote, True
+            return (None if ch == quote else quote), False
+        if ch in "\"'`":
+            return ch, False
+        if ch in _OPEN_TO_CLOSE:
+            stack.append(_OPEN_TO_CLOSE[ch])
+        elif ch in _CLOSERS and stack and stack[-1] == ch:
+            stack.pop()
+        return None, False
+
+    i = start
+    while i < end:
+        quote, escaped = consume(content[i], stack, quote, escaped)
+        i += 1
+    if not stack:
+        return end
+
+    limit = min(len(content), end + 400)
+    while i < limit and stack:
+        quote, escaped = consume(content[i], stack, quote, escaped)
+        i += 1
+    return i if not stack else end
+
+
 def strategy_token_match(content: str, old: str) -> MatchResult | None:
     old_tokens = tokenize(old)
     if len(old_tokens) < 3:
@@ -295,6 +344,7 @@ def strategy_token_match(content: str, old: str) -> MatchResult | None:
                 if content[end] in "\n\r":
                     break
                 end += 1
+            end = _bracket_balanced_end(content, start, end)
             return MatchResult(start, end - start)
     return None
 

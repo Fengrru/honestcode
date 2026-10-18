@@ -17,8 +17,8 @@ outlines how to contribute code, report issues, and request features.
 
 2. Clone your fork locally:
    ```bash
-   git clone https://github.com/<your-username>/honestcode-mcp.git
-   cd honestcode-mcp
+   git clone https://github.com/<your-username>/honestcode.git
+   cd honestcode
    ```
 
 3. Create a virtual environment and install in editable mode:

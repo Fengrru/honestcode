@@ -8,6 +8,7 @@ facts rather than prose.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ BENCH_DIR = Path(__file__).resolve().parents[1] / "benchmarks" / "value_drift"
 if str(BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(BENCH_DIR))
 
+import run as value_drift_run  # noqa: E402
 from corpus import SCENARIOS  # noqa: E402
 from run import (  # noqa: E402
     CORRECT,
@@ -188,3 +190,42 @@ def test_match_at_all_reports_the_winning_strategy():
     match, name = match_at_all(GUARDED_STRATEGIES, scenario.file, scenario.search)
     assert match is not None
     assert name in {s.name for s in GUARDED_STRATEGIES}
+
+
+# ── the gate itself ─────────────────────────────────────────────────────────
+
+
+def test_a_partial_interior_match_is_wrong_span():
+    """Containment alone used to make this ``correct``.
+
+    Matching only the value literal and splicing the whole replacement into
+    the middle of the region leaves the surrounding call in place.
+    """
+    scenario = SCENARIOS[0]
+    needle = "port=8080,"
+    assert needle in scenario.intended_region
+    index = scenario.file.index(needle)
+    patched = scenario.file[:index] + scenario.replace + scenario.file[index + len(needle) :]
+    result = classify(scenario, patched, index, len(needle), needle)
+    assert result == WRONG_SPAN
+
+
+def test_the_gate_fails_when_the_guarded_matcher_refuses_everything(monkeypatch, capsys):
+    """All-refusals used to pass CI; an over-strict matcher must not."""
+    monkeypatch.setattr(sys, "argv", ["run.py"])
+    monkeypatch.setitem(value_drift_run.ALL_STRATEGY_SETS, value_drift_run.GUARDED_LABEL, [])
+    code = value_drift_run.main()
+    output = capsys.readouterr().out
+    assert code == 2
+    assert "FAIL" in output
+
+
+def test_json_mode_keeps_stdout_parseable(monkeypatch, capsys):
+    """The status line belongs on stderr when JSON was requested."""
+    monkeypatch.setattr(sys, "argv", ["run.py", "--json"])
+    code = value_drift_run.main()
+    captured = capsys.readouterr()
+    assert code == 0
+    payload = json.loads(captured.out)  # must be JSON and nothing else
+    assert value_drift_run.GUARDED_LABEL in payload
+    assert "OK" in captured.err

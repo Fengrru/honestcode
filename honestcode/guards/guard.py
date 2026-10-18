@@ -493,7 +493,17 @@ class SideEffectGuard:
                     "an irreversible effect that already failed must be resolved by "
                     "hand — its partial effects cannot be assumed away",
                 )
-            self.store.set_status(existing.effect_id, PENDING)
+            # The transition is conditional on the status we just read: two
+            # concurrent retries both used to see FAILED, both reset it to
+            # PENDING, and both ran the effect. Only the caller whose UPDATE
+            # changes a row may execute.
+            if not self.store.transition_if_status(
+                existing.effect_id, (FAILED, COMPENSATED), PENDING
+            ):
+                winner = self.store.find_by_key(session_id, key)
+                if winner is None:  # pragma: no cover - row cannot vanish
+                    raise StoreError(f"effect key {key} vanished during retry")
+                return winner, False
             return self.store.get(existing.effect_id) or existing, True
 
         effect_id = f"se_{uuid.uuid4().hex}"
@@ -506,6 +516,7 @@ class SideEffectGuard:
             effect_class=effect_class,
             payload_hash=_hash_payload(payload),
             preconditions=tuple(p.name for p in preconditions),
+            scope=scope,
         )
         if inserted is None:
             # Lost a race with a concurrent caller for the same effect. Adopt
@@ -543,7 +554,8 @@ class SideEffectGuard:
                 record.effect_id,
                 record.status,
                 "a previous attempt may have reached the outside world; call "
-                "recover() to get a decision for this effect",
+                "recover() — or recover(scope=...) for a scoped effect — to get "
+                "a decision for this effect",
             )
         raise EffectNotRunnable(record.effect_id, record.status, "the effect is already claimed")
 
@@ -553,7 +565,9 @@ class SideEffectGuard:
 
     # ── recovery ────────────────────────────────────────────────────────────
 
-    def recover(self, session_id: str | None = None) -> list[RecoveryDecision]:
+    def recover(
+        self, session_id: str | None = None, *, scope: str | None = None
+    ) -> list[RecoveryDecision]:
         """Decide what to do about every effect whose outcome is unknown.
 
         Call this at session start, before any new work. Each decision names the
@@ -561,9 +575,19 @@ class SideEffectGuard:
         to carry it out or escalate — this method deliberately does not execute
         anything, because the safe action for an irreversible effect is a human
         looking at the vendor's dashboard.
+
+        Pass *scope* (the same value given to :meth:`run`) to recover effects
+        that were written under ``durable_scope``. Those records live in a
+        namespace derived from the scope, not under the current session id, so
+        the session-only query used to return nothing for exactly the
+        cross-restart case the scope exists to make safe.
         """
-        sid = session_id or self.session_id
-        return [self.decide(record) for record in self.store.unresolved(sid)]
+        if scope is not None:
+            records = self.store.unresolved(scope=scope)
+        else:
+            sid = session_id or self.session_id
+            records = self.store.unresolved(sid)
+        return [self.decide(record) for record in records]
 
     def decide(self, record: EffectRecord) -> RecoveryDecision:
         """Map one record to its recovery action.
@@ -713,10 +737,16 @@ class SideEffectGuard:
 
     # ── introspection ───────────────────────────────────────────────────────
 
-    def effects(self, *, status: EffectStatus | None = None) -> list[EffectRecord]:
+    def effects(
+        self, *, status: EffectStatus | None = None, scope: str | None = None
+    ) -> list[EffectRecord]:
+        if scope is not None:
+            return self.store.list_records(status=status, scope=scope)
         return self.store.list_records(session_id=self.session_id, status=status)
 
-    def summary(self) -> dict[str, int]:
+    def summary(self, *, scope: str | None = None) -> dict[str, int]:
+        if scope is not None:
+            return self.store.count_by_status(scope=scope)
         return self.store.count_by_status(self.session_id)
 
 

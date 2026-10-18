@@ -16,7 +16,7 @@ import ast
 from pathlib import Path
 
 from honestcode.structure.relations import ParseResult, StructEdge
-from honestcode.structure.utils import call_name
+from honestcode.structure.utils import call_name, read_python_source
 
 __all__ = ["StructureExtractor"]
 
@@ -32,9 +32,21 @@ class StructureExtractor:
         self.parser = parser
 
     def parse_file(self, file_path: str | Path) -> ParseResult:
-        """Parse *file_path* and return a ``ParseResult``."""
-        p = Path(file_path)
-        source = p.read_text(encoding="utf-8")
+        """Parse *file_path* and return a ``ParseResult``.
+
+        Source is decoded through :func:`read_python_source`, so a legal
+        non-UTF-8 file (a PEP 263 coding cookie) is read correctly and an
+        undecodable one is skipped rather than aborting the whole project index.
+        """
+        source = read_python_source(file_path)
+        if source is None:
+            return ParseResult(
+                edges=[],
+                func_defs={},
+                class_defs={},
+                var_defs={},
+                imports=set(),
+            )
         return self.parse_source(source)
 
     def parse_source(self, source: str) -> ParseResult:

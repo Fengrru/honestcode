@@ -24,8 +24,10 @@ python benchmarks/realworld_fp/run.py --format json
 python benchmarks/realworld_fp/run.py --project /path/to/another/project
 ```
 
-Exit code is `0` when the corpus is clean and `2` when any finding is
-reported — a finding on this corpus is, by construction, a false positive.
+Exit code is `0` when the corpus is clean and `2` when any finding is reported,
+a file could not be verified, or no Python files were found (a broken
+`--project` must not look like a pass). A finding on this corpus is, by
+construction, a false positive.
 
 ## The vendored project
 
