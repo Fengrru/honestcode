@@ -55,7 +55,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=4.0",
     "ruff>=0.6",
-    "pre-commit>=3.0",
+    "pre-commit>=4.6.2",
 ]
 pydantic-ai = [
     "pydantic-ai-slim>=2.55",
