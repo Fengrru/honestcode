@@ -36,3 +36,9 @@ benchmarks/realworld_fp/vendor/** -text
 
 .gitattributes text eol=lf
 .editorconfig text eol=lf
+
+# Fixture data, not project code: keep the vendored snapshot out of the
+# language bar and dependency graphs.
+benchmarks/realworld_fp/vendor/** linguist-vendored
+benchmarks/realworld_fp/vendor/** -linguist-documentation
+demos/** linguist-vendored
