@@ -114,10 +114,29 @@ missed finding for a false one.
 
 ## Install
 
+One line — no clone, no virtualenv (once the package is on PyPI):
+
+```bash
+claude mcp add honestcode -- uvx honestcode-mcp
+```
+
+`uvx` fetches the server into an isolated environment on first use; install
+[`uv`](https://docs.astral.sh/uv/) first if you do not have it. Until the
+first PyPI release is published, install from a checkout:
+
 ```bash
 git clone https://github.com/Fengrru/honestcode
 cd honestcode
 pip install -e .
+claude mcp add honestcode -- honestcode-mcp
+```
+
+**Cursor / VS Code / Claude Desktop:** the `honestcode install` command probes
+those clients' config files and registers the server for you:
+
+```bash
+honestcode install            # all detected clients
+honestcode install --client cursor --dry-run   # preview without writing
 ```
 
 Requires Python >= 3.10. 100% local.
@@ -160,6 +179,37 @@ file you just wrote and fix anything it reports.
 
 HonestCode auto-discovers the project root from the file path, indexes the
 codebase, and returns grounded evidence.
+
+### Making it automatic (no prompt discipline required)
+
+MCP tools only run when the model chooses to call them. To make verification
+unconditional, wire the hook in `scripts/claude_hook.py` into Claude Code's
+PostToolUse event — every `.py` file the agent writes is verified, and a
+finding blocks the edit with the evidence fed straight back into the
+conversation:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /absolute/path/to/honestcode/scripts/claude_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Put that in `~/.claude/settings.json` (all projects) or
+`.claude/settings.json` (one project). The hook never blocks on its own
+failures: unreadable input, non-Python files, and verification crashes all
+exit silently, so it can never turn into a wall that blocks every edit.
 
 ---
 

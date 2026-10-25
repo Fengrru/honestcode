@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.Fengrru/honestcode",
+  "display_name": "HonestCode",
+  "description": "The deterministic verification layer for AI coding agents: checks every call the agent writes against the repository it is grounded in and reports invented APIs, undefined symbols, wrong arities, and syntax errors with actionable evidence. Pure AST, no LLM, no network.",
+  "version": "0.4.0",
+  "website_url": "https://github.com/Fengrru/honestcode",
+  "repository": {
+    "url": "https://github.com/Fengrru/honestcode",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registry_type": "pypi",
+      "identifier": "honestcode",
+      "transport": {
+        "type": "stdio",
+        "command": "honestcode-mcp"
+      }
+    }
+  ]
+}
