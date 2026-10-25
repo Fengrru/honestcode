@@ -2,13 +2,13 @@
 
 ## Supported Versions
 
-The package is at 0.4.0. Only the current release is supported; there is no
+The package is at 0.5.0. Only the current release is supported; there is no
 maintenance branch for earlier versions.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.4.x   | :white_check_mark: |
-| < 0.4.0 | :x:                |
+| 0.5.x   | :white_check_mark: |
+| < 0.5.0 | :x:                |
 
 ## Reporting a Vulnerability
 
