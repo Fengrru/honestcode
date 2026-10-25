@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -30,9 +31,10 @@ logger = logging.getLogger(__name__)
 __all__ = ["SymbolInfo", "SymbolIndex", "ProjectIndex", "get_project_index"]
 
 # Bumped whenever the cache payload gains a field the verifier relies on
-# (v2 added file_names/module_symbols for re-export resolution); older cache
+# (v2 added file_names/module_symbols for re-export resolution; v3 added
+# file_class_bases/class_base_names for subclass detection); older cache
 # files are ignored so a stale on-disk index cannot silently degrade results.
-_INDEX_CACHE_VERSION = 2
+_INDEX_CACHE_VERSION = 3
 
 # The cache file name is ``<root name>_<16 hex chars>.json``; the glob is
 # narrow so pruning a user-supplied cache directory cannot touch unrelated
@@ -81,6 +83,13 @@ class ProjectIndex:
     file_names: dict[str, set[str]] = field(default_factory=dict)
     # module qname -> module-level bound names (aggregated from file_names).
     module_symbols: dict[str, set[str]] = field(default_factory=dict)
+    # rel path (posix) -> short names every class in that file inherits from.
+    # Lets ``may_be_subclassed`` answer from the index instead of parsing every
+    # class-defining file at verification time (a cold scan on a few-hundred-
+    # file project paid seconds for that gate).
+    file_class_bases: dict[str, set[str]] = field(default_factory=dict)
+    # Union of every base short name in the project.
+    class_base_names: set[str] = field(default_factory=set)
 
     def to_sqlite(self, db_path: str | Path) -> None:
         import sqlite3
@@ -202,6 +211,7 @@ class ProjectIndexJSON:
                 for rel, syms in idx.file_symbols.items()
             },
             "file_names": {rel: sorted(names) for rel, names in idx.file_names.items()},
+            "file_class_bases": {rel: sorted(names) for rel, names in idx.file_class_bases.items()},
         }
 
     @staticmethod
@@ -213,6 +223,9 @@ class ProjectIndexJSON:
         }
         root = data.get("root", "")
         file_names = {rel: set(names) for rel, names in data.get("file_names", {}).items()}
+        file_class_bases = {
+            rel: set(names) for rel, names in data.get("file_class_bases", {}).items()
+        }
         return ProjectIndex(
             root=root,
             symbols=symbols,
@@ -221,6 +234,8 @@ class ProjectIndexJSON:
             stats={k: list(v) for k, v in data.get("stats", {}).items()},
             file_symbols=file_symbols,
             file_names=file_names,
+            file_class_bases=file_class_bases,
+            class_base_names=set().union(*file_class_bases.values()) if file_class_bases else set(),
             module_symbols=_build_module_symbols(root, file_names),
         )
 
@@ -234,12 +249,14 @@ def _module_name(file: Path, root: Path) -> str:
     return module_name_for(file, root)
 
 
-def _merge(rel: str, module: str, res) -> tuple[dict[str, SymbolInfo], set[str]]:
-    """Turn a ParseResult into ``({qualified name: SymbolInfo}, bound names)``.
+def _merge(rel: str, module: str, res) -> tuple[dict[str, SymbolInfo], set[str], set[str]]:
+    """Turn a ParseResult into ``({qualified name: SymbolInfo}, bound names, base names)``.
 
     The second element lists every name bound at the module's top level —
     definitions plus imported aliases — which is what makes re-exports
-    (``from .compat import urlparse``) resolvable against the index.
+    (``from .compat import urlparse``) resolvable against the index. The third
+    lists the short names every class in the file inherits from, so subclass
+    detection never has to re-parse the file.
     """
     symbols: dict[str, SymbolInfo] = {}
     names: set[str] = set()
@@ -259,7 +276,8 @@ def _merge(rel: str, module: str, res) -> tuple[dict[str, SymbolInfo], set[str]]
         _add(vn, s + 1, "variable")
     names.update((res.imported_symbols or {}).keys())
 
-    return symbols, names
+    bases = {b.rsplit(".", 1)[-1] for bases in (res.class_bases or {}).values() for b in bases}
+    return symbols, names, bases
 
 
 def _index_directory(
@@ -274,10 +292,12 @@ def _index_directory(
     prev_stats = previous.stats if previous else {}
     prev_syms = previous.file_symbols if previous else {}
     prev_names = previous.file_names if previous else {}
+    prev_bases = previous.file_class_bases if previous else {}
 
     symbols: dict[str, SymbolInfo] = {}
     file_symbols: dict[str, dict[str, SymbolInfo]] = {}
     file_names: dict[str, set[str]] = {}
+    file_class_bases: dict[str, set[str]] = {}
     files: list[str] = []
     reused = 0
     for rel in sorted(files_map):
@@ -286,12 +306,14 @@ def _index_directory(
         if unchanged and rel in prev_syms and rel in prev_names:
             file_symbols[rel] = prev_syms[rel]
             file_names[rel] = prev_names[rel]
+            file_class_bases[rel] = prev_bases.get(rel, set())
             reused += 1
         else:
             module = module_name_for(files_map[rel], root)
-            per_file, names = _merge(rel, module, extractor.parse_file(files_map[rel]))
+            per_file, names, bases = _merge(rel, module, extractor.parse_file(files_map[rel]))
             file_symbols[rel] = per_file
             file_names[rel] = names
+            file_class_bases[rel] = bases
         symbols.update(file_symbols[rel])
 
     if previous is not None and reused:
@@ -310,6 +332,8 @@ def _index_directory(
         stats=stats,
         file_symbols=file_symbols,
         file_names=file_names,
+        file_class_bases=file_class_bases,
+        class_base_names=(set().union(*file_class_bases.values()) if file_class_bases else set()),
         module_symbols=_build_module_symbols(str(root), file_names),
     )
 
@@ -330,8 +354,11 @@ def _build_module_symbols(root: str, file_names: dict[str, set[str]]) -> dict[st
 
 # Module-level cache to avoid re-indexing within a single process. Entries are
 # validated against the tree's metadata on every access (see get_project_index),
-# so an edited project is rebuilt instead of served stale.
+# so an edited project is rebuilt instead of served stale. The lock guards the
+# dict itself: FastMCP runs sync tools on worker threads and the watcher thread
+# writes here, so concurrent get/pop/set must not interleave.
 _index_cache: dict[str, ProjectIndex] = {}
+_index_cache_lock = threading.Lock()
 
 
 def get_project_index(
@@ -360,16 +387,17 @@ def get_project_index(
 
     previous: ProjectIndex | None = None
     if not force_rebuild:
-        cached = _index_cache.get(str(resolved))
-        if cached is not None:
-            if _stats_fresh(resolved, cached.stats):
-                # Mark the shared instance so callers can tell that this
-                # response was served unchanged (a rebuild creates a fresh
-                # object with cached=False).
-                cached.cached = True
-                return cached
-            previous = cached  # stale: fall through to an incremental rebuild
-            _index_cache.pop(str(resolved), None)
+        with _index_cache_lock:
+            cached = _index_cache.get(str(resolved))
+            if cached is not None:
+                if _stats_fresh(resolved, cached.stats):
+                    # Mark the shared instance so callers can tell that this
+                    # response was served unchanged (a rebuild creates a fresh
+                    # object with cached=False).
+                    cached.cached = True
+                    return cached
+                previous = cached  # stale: fall through to an incremental rebuild
+                _index_cache.pop(str(resolved), None)
 
         if previous is None and cache_path.exists():
             try:
@@ -397,7 +425,8 @@ def get_project_index(
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to write cache %s: %s", cache_path, e)
 
-    _index_cache[str(resolved)] = idx
+    with _index_cache_lock:
+        _index_cache[str(resolved)] = idx
     return idx
 
 

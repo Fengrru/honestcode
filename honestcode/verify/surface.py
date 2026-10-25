@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import ast
 import os
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from honestcode.structure.utils import call_name, read_python_source
+from honestcode.structure.utils import annotation_name, call_name, read_python_source
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -189,27 +190,8 @@ def _arity(
     )
 
 
-def annotation_name(node: ast.expr) -> str | None:
-    """Return a dotted name for an annotation (handles string annotations)."""
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parts: list[str] = []
-        cur: ast.expr = node
-        while isinstance(cur, ast.Attribute):
-            parts.append(cur.attr)
-            cur = cur.value
-        if isinstance(cur, ast.Name):
-            parts.append(cur.id)
-            return ".".join(reversed(parts))
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        # ``from __future__ import annotations`` stores annotations verbatim.
-        text = node.value.strip()
-        if text.replace(".", "").replace("_", "").isidentifier():
-            return text
-    if isinstance(node, ast.Subscript):  # Optional[UserClient], list[UserClient], ...
-        return annotation_name(node.value)
-    return None
+# ``annotation_name`` moved to ``structure.utils`` (the symbol index needs it
+# too); the import above re-exports it so existing importers keep working.
 
 
 def _iter_scope(node: ast.AST, prefix: str) -> Iterator[tuple[ast.AST, str]]:
@@ -455,6 +437,9 @@ _FILE_FACTS: OrderedDict[
     tuple[str, str, str, int, int],
     tuple[dict[str, ClassSurface], dict[str, MethodInfo], dict[str, str]],
 ] = OrderedDict()
+# FastMCP runs sync tools on worker threads, so the LRU's
+# get/move_to_end/insert/popitem sequence needs a lock to stay coherent.
+_FILE_FACTS_LOCK = threading.Lock()
 
 
 def _read_source(path_str: str) -> str | None:
@@ -486,10 +471,11 @@ def load_file_facts(
     other scan silently missed findings.
     """
     key = (str(path), module, file_label, *file_fingerprint(path))
-    cached = _FILE_FACTS.get(key)
-    if cached is not None:
-        _FILE_FACTS.move_to_end(key)
-        return cached
+    with _FILE_FACTS_LOCK:
+        cached = _FILE_FACTS.get(key)
+        if cached is not None:
+            _FILE_FACTS.move_to_end(key)
+            return cached
 
     source = _read_source(str(path))
     facts: tuple[dict[str, ClassSurface], dict[str, MethodInfo], dict[str, str]]
@@ -504,7 +490,8 @@ def load_file_facts(
             classes, functions = extract_file_surfaces(tree, module=module, file_label=file_label)
             facts = (classes, functions, imported_symbols_of(tree))
 
-    _FILE_FACTS[key] = facts
-    if len(_FILE_FACTS) > _MAX_CACHED_FILES:
-        _FILE_FACTS.popitem(last=False)
+    with _FILE_FACTS_LOCK:
+        _FILE_FACTS[key] = facts
+        if len(_FILE_FACTS) > _MAX_CACHED_FILES:
+            _FILE_FACTS.popitem(last=False)
     return facts

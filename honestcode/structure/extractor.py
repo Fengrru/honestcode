@@ -16,7 +16,7 @@ import ast
 from pathlib import Path
 
 from honestcode.structure.relations import ParseResult, StructEdge
-from honestcode.structure.utils import call_name, read_python_source
+from honestcode.structure.utils import annotation_name, call_name, read_python_source
 
 __all__ = ["StructureExtractor"]
 
@@ -68,6 +68,7 @@ class StructureExtractor:
         var_defs: dict[str, tuple[int, int]] = {}
         imports: set[str] = set()
         imported_symbols: dict[str, str] = {}
+        class_bases: dict[str, list[str]] = {}
         edges: list[StructEdge] = []
 
         self._walk(
@@ -80,6 +81,7 @@ class StructureExtractor:
             imports=imports,
             imported_symbols=imported_symbols,
             edges=edges,
+            class_bases=class_bases,
         )
 
         return ParseResult(
@@ -91,6 +93,7 @@ class StructureExtractor:
             imported_symbols=imported_symbols,
             exported_symbols={n for n in func_defs if not n.startswith("_")}
             | {n for n in class_defs if not n.startswith("_")},
+            class_bases=class_bases,
         )
 
     def _walk(
@@ -104,6 +107,7 @@ class StructureExtractor:
         imports: set[str],
         imported_symbols: dict[str, str],
         edges: list[StructEdge],
+        class_bases: dict[str, list[str]],
         in_function: bool = False,
     ) -> None:
         """Recursively walk the AST collecting definitions and edges.
@@ -127,12 +131,16 @@ class StructureExtractor:
                     imports=imports,
                     imported_symbols=imported_symbols,
                     edges=edges,
+                    class_bases=class_bases,
                     in_function=True,
                 )
             elif isinstance(child, ast.ClassDef):
                 name = self._scoped_name(scope, child.name)
                 class_defs[name] = (child.lineno - 1, child.end_lineno - 1)
                 self._collect_local_edges(child, name, func_defs, class_defs, var_defs, edges)
+                bases = [b for b in (annotation_name(x) for x in child.bases) if b]
+                if bases:
+                    class_bases[name] = bases
                 self._walk(
                     child,
                     source,
@@ -143,6 +151,7 @@ class StructureExtractor:
                     imports=imports,
                     imported_symbols=imported_symbols,
                     edges=edges,
+                    class_bases=class_bases,
                     # Class bodies hold class attributes, not function locals —
                     # even when the class itself is nested in a function.
                     in_function=False,
@@ -184,6 +193,7 @@ class StructureExtractor:
                     imports=imports,
                     imported_symbols=imported_symbols,
                     edges=edges,
+                    class_bases=class_bases,
                     in_function=in_function,
                 )
 

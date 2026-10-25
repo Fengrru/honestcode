@@ -23,6 +23,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +63,8 @@ class StoreError(RuntimeError):
     """The store could not be read or written."""
 
 
-class EffectStatus(str):
-    """Lifecycle states, as a plain ``str`` subclass so they survive JSON.
+class EffectStatus(str, Enum):
+    """Lifecycle states, as a ``str`` enum so they survive JSON round-trips.
 
     The set is deliberately larger than upstream's ``PENDING/COMMITTED/
     COMPENSATED/FAILED``. ``EXECUTING`` is the state that makes recovery sound:
@@ -74,32 +75,37 @@ class EffectStatus(str):
     agent retries an external mutation.
     """
 
-    def __new__(cls, value: str) -> EffectStatus:
-        return super().__new__(cls, value)
+    PENDING = "pending"
+    """Intent recorded; the effect has not been attempted yet."""
+
+    EXECUTING = "executing"
+    """The effect may have reached the outside world. Outcome unknown until the
+    record advances — this is the state a crash leaves behind."""
+
+    COMMITTED = "committed"
+    """The effect ran and its result is recorded. Never re-run; serve the receipt."""
+
+    FAILED = "failed"
+    """The effect raised. Whether it partially applied is unknown; the class
+    decides whether retrying is safe."""
+
+    COMPENSATED = "compensated"
+    """A reversible effect was undone. Safe to attempt again."""
 
     @property
     def bare(self) -> str:
-        return str(self)
+        return self.value
 
 
-PENDING = EffectStatus("pending")
-"""Intent recorded; the effect has not been attempted yet."""
+# Historical module-level names; guard.py, __init__.py and tests import these,
+# so the enum members are re-exported under the same identities.
+PENDING = EffectStatus.PENDING
+EXECUTING = EffectStatus.EXECUTING
+COMMITTED = EffectStatus.COMMITTED
+FAILED = EffectStatus.FAILED
+COMPENSATED = EffectStatus.COMPENSATED
 
-EXECUTING = EffectStatus("executing")
-"""The effect may have reached the outside world. Outcome unknown until the
-record advances — this is the state a crash leaves behind."""
-
-COMMITTED = EffectStatus("committed")
-"""The effect ran and its result is recorded. Never re-run; serve the receipt."""
-
-FAILED = EffectStatus("failed")
-"""The effect raised. Whether it partially applied is unknown; the class
-decides whether retrying is safe."""
-
-COMPENSATED = EffectStatus("compensated")
-"""A reversible effect was undone. Safe to attempt again."""
-
-_ALL_STATUSES = frozenset({PENDING, EXECUTING, COMMITTED, FAILED, COMPENSATED})
+_ALL_STATUSES = frozenset(EffectStatus)
 
 #: Statuses where re-running the effect would be a second real-world event.
 ACTIVE_STATUSES = frozenset({PENDING, EXECUTING, COMMITTED})
@@ -275,7 +281,7 @@ class EffectStore:
                         effect_class.value,
                         payload_hash,
                         json.dumps(list(preconditions)),
-                        str(status),
+                        status.value,
                         scope,
                         now,
                         now,
@@ -307,7 +313,7 @@ class EffectStore:
                        committed_at = COALESCE(?, committed_at)
                  WHERE effect_id = ?
                 """,
-                (str(status), now, response_hash, committed_at, effect_id),
+                (status.value, now, response_hash, committed_at, effect_id),
             )
             if cur.rowcount == 0:
                 raise StoreError(f"no such effect: {effect_id}")
@@ -331,7 +337,7 @@ class EffectStore:
         """
         if status not in _ALL_STATUSES:
             raise StoreError(f"unknown status: {status!r}")
-        allowed_values = tuple(str(s) for s in allowed)
+        allowed_values = tuple(s.value for s in allowed)
         if not allowed_values:
             return False
         placeholders = ", ".join("?" for _ in allowed_values)
@@ -339,7 +345,7 @@ class EffectStore:
             cur = self._conn.execute(
                 f"UPDATE side_effects SET status = ?, updated_at = ? "
                 f"WHERE effect_id = ? AND status IN ({placeholders})",
-                (str(status), _now_millis(), effect_id, *allowed_values),
+                (status.value, _now_millis(), effect_id, *allowed_values),
             )
             return cur.rowcount == 1
 
@@ -389,7 +395,7 @@ class EffectStore:
             params.append(session_id)
         if status is not None:
             clauses.append("status = ?")
-            params.append(str(status))
+            params.append(status.value)
         if scope is not None:
             # Scoped records live under a namespace session id, so filtering by
             # the caller's session missed them entirely; scope is the column
@@ -417,7 +423,7 @@ class EffectStore:
         and cannot be supplied by the caller.
         """
         clauses = ["status IN (?, ?)"]
-        params: list[Any] = [str(EXECUTING), str(PENDING)]
+        params: list[Any] = [EXECUTING.value, PENDING.value]
         if session_id is not None:
             clauses.append("session_id = ?")
             params.append(session_id)

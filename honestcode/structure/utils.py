@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 __all__ = [
+    "annotation_name",
     "call_base",
     "call_name",
     "importable_root",
@@ -207,6 +208,34 @@ def call_name(node: ast.expr) -> str | None:
         if isinstance(current, ast.Name):
             parts.append(current.id)
             return ".".join(reversed(parts))
+    return None
+
+
+def annotation_name(node: ast.expr) -> str | None:
+    """Return a dotted name for an annotation (handles string annotations).
+
+    Lives here rather than in ``verify.surface`` so the symbol index can use
+    it too: recording class base names at index time is what keeps
+    ``may_be_subclassed`` from parsing the whole project on every scan.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parts: list[str] = []
+        cur: ast.expr = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+            return ".".join(reversed(parts))
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        # ``from __future__ import annotations`` stores annotations verbatim.
+        text = node.value.strip()
+        if text.replace(".", "").replace("_", "").isidentifier():
+            return text
+    if isinstance(node, ast.Subscript):  # Optional[UserClient], list[UserClient], ...
+        return annotation_name(node.value)
     return None
 
 

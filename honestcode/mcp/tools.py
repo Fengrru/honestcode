@@ -21,12 +21,17 @@ hallucination-detection capabilities exposed to MCP clients:
 from __future__ import annotations
 
 import ast
+import importlib.metadata
+import importlib.util
 import logging
 import os
 import re
 import sqlite3
 import subprocess
+import sys
+import sysconfig
 import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 
@@ -54,7 +59,12 @@ from honestcode.verify.evidence import (
     build_report,
     render_text,
 )
-from honestcode.verify.verify import star_imports_unresolved, valid_imported_names, verify_tree
+from honestcode.verify.verify import (
+    resolve_package_relative_imports,
+    star_imports_unresolved,
+    valid_imported_names,
+    verify_tree,
+)
 
 __all__ = [
     "index_project",
@@ -367,6 +377,10 @@ def _with_module_prefix(p: Path, root: Path, res: ParseResult) -> ParseResult:
         exported_symbols={
             prefix + s if not s.startswith(prefix) else s for s in (res.exported_symbols or set())
         },
+        class_bases={
+            prefix + k if not k.startswith(prefix) else k: v
+            for k, v in (res.class_bases or {}).items()
+        },
     )
 
 
@@ -564,35 +578,47 @@ def _get_call_graph(root: Path) -> CallGraph:
     return graph
 
 
-_watcher: ProjectWatcher | None = None
+# One background watcher per watched root. A single global used to mean the
+# second ``index_project(watch=True)`` silently went unwatched while still
+# reporting ``watching: true``.
+_watchers: dict[str, ProjectWatcher] = {}
 
 
 def _ensure_watcher(root: Path) -> None:
     """Start a background file watcher that auto-reindexes on changes."""
-    global _watcher
-    if _watcher is not None:
-        return
+    key = str(root)
+    with _state_lock:
+        if key in _watchers:
+            return
 
     def _on_change(changed: list) -> None:
         global _project_index, _project_root
         idx = get_project_index(root, force_rebuild=False)
         with _state_lock:
-            _project_index = idx
-            _project_root = root
+            _index_by_root[key] = idx
+            # The watched root only becomes "the" project when the session is
+            # not already anchored elsewhere; multi-root sessions keep the
+            # last explicitly indexed project for the graph tools.
+            if _project_root is None or Path(_project_root) == root:
+                _project_index = idx
+                _project_root = root
             _invalidate_graph_cache()
         logger.info("Watcher: re-indexed after %d file changes", len(changed))
 
-    _watcher = ProjectWatcher(root, _on_change).start()
+    watcher = ProjectWatcher(root, _on_change).start()
+    with _state_lock:
+        _watchers[key] = watcher
 
 
 def stop_watching() -> dict:
-    """Stop the background file watcher, if any."""
-    global _watcher
+    """Stop every background file watcher, if any."""
     with _state_lock:
-        if _watcher is None:
+        if not _watchers:
             return {"success": True, "watching": False}
-        _watcher.stop()
-        _watcher = None
+        watchers = list(_watchers.values())
+        _watchers.clear()
+    for watcher in watchers:
+        watcher.stop()
     return {"success": True, "watching": False}
 
 
@@ -616,7 +642,7 @@ def index_project(root_path: str, force_rebuild: bool = False, watch: bool = Fal
         "symbols_indexed": len(idx.symbols),
         "root": str(resolved),
         "cached": idx.cached,
-        "watching": _watcher is not None,
+        "watching": str(resolved) in _watchers,
     }
 
 
@@ -759,6 +785,59 @@ def check_symbol(symbol_name: str, file_path: str | None = None) -> dict:
     }
 
 
+def _is_stdlib_root(name: str) -> bool:
+    """Whether *name* is a standard-library root that really is the stdlib.
+
+    ``sys.stdlib_module_names`` alone is not enough: a workspace file called
+    ``math.py`` shadows the real module for imports from the server's cwd, so
+    the spec's origin must sit inside the interpreter's stdlib directory (or
+    the module must be baked in) before importing it is allowed.
+    """
+    if name not in stdlib_roots():
+        return False
+    try:
+        spec = importlib.util.find_spec(name)
+    except Exception:  # noqa: BLE001 - a broken spec is not a stdlib module
+        return False
+    if spec is None:
+        return False
+    origin = getattr(spec, "origin", None)
+    if origin in (None, "built-in", "frozen"):
+        # A workspace directory can shadow a stdlib name as a namespace
+        # package (origin None); only genuinely built-in/frozen modules are
+        # safe to trust in that case. "built-in"/"frozen" cannot be shadowed.
+        return origin is not None or name in sys.builtin_module_names
+    stdlib_dir = Path(sysconfig.get_paths()["stdlib"]).resolve()
+    try:
+        return Path(origin).resolve().is_relative_to(stdlib_dir)
+    except (OSError, ValueError):
+        return False
+
+
+def _installed_import_root(name: str) -> bool:
+    """Whether *name* is an installed distribution or a real import root.
+
+    ``check_api`` imports the base package on demand to answer a CLI caller
+    who cannot run ``load-package`` first. Importing executes code, so the
+    gate must not open for a bare file in the workspace: an agent-written
+    ``evil_payload.py`` next to the server's cwd is importable via ``sys.path``
+    but is not an installed distribution, and importing it would run
+    agent-authored code inside the server process. Distribution metadata is
+    read without executing anything.
+    """
+    if name in _dep_kb.roots() or _is_stdlib_root(name):
+        return True
+    try:
+        importlib.metadata.distribution(name)
+        return True
+    except Exception:  # noqa: BLE001 - not installed under this spelling
+        pass
+    try:
+        return name in importlib.metadata.packages_distributions()
+    except Exception:  # noqa: BLE001 - metadata unavailable
+        return False
+
+
 def check_api(api_name: str) -> dict:
     """Verify a library API call is correct (e.g. pd.read_exel -> read_excel)."""
     if _dep_kb.has(api_name):
@@ -767,11 +846,12 @@ def check_api(api_name: str) -> dict:
     base = api_name.split(".")[0]
     dep_names = _dep_kb.all_names()
     base_known = _dep_kb.has(base) or any(k.startswith(base + ".") for k in dep_names)
-    if not base_known:
+    if not base_known and _installed_import_root(base):
         # A CLI invocation is a fresh process: the user cannot first run
         # ``load-package`` and then ``check-api``. Load the base package on
-        # demand (the API name is exactly the package the caller is asking
-        # about, so importing it is the documented behaviour of this tool).
+        # demand — but only when it is genuinely installed (or already
+        # declared); an uninstalled name must not be imported, or a file the
+        # agent dropped into the workspace gets executed server-side.
         with suppress(Exception):  # an absent package is a valid answer
             _dep_kb.load_package(base)
         dep_names = _dep_kb.all_names()
@@ -824,19 +904,18 @@ def _collect_local_defined(tree: ast.AST) -> set[str]:
 
     Includes parameters and assignment targets so that ``self.helper()`` or
     ``client.fetch()`` are not flagged when ``self`` / ``client`` are bound
-    in the enclosing scope.
+    in the enclosing scope. Names bound by ``with ... as``, ``except ... as``,
+    lambda parameters, comprehension targets and ``global``/``nonlocal``
+    declarations count too — missing them reported ``fn()`` under
+    ``with Ctx() as fn:`` as an undefined symbol.
     """
     defined: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             defined.add(node.name)
-            for a in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
-                if a.arg:
-                    defined.add(a.arg)
-            if node.args.vararg:
-                defined.add(node.args.vararg.arg)
-            if node.args.kwarg:
-                defined.add(node.args.kwarg.arg)
+            _collect_arg_names(node.args, defined)
+        elif isinstance(node, ast.Lambda):
+            _collect_arg_names(node.args, defined)
         elif isinstance(node, ast.ClassDef):
             defined.add(node.name)
         elif isinstance(node, ast.Assign):
@@ -846,10 +925,31 @@ def _collect_local_defined(tree: ast.AST) -> set[str]:
             defined.add(node.target.id)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             _collect_assign_targets(node.target, defined)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    _collect_assign_targets(item.optional_vars, defined)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                defined.add(node.name)
+        elif isinstance(node, ast.comprehension):
+            _collect_assign_targets(node.target, defined)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            defined.update(node.names)
         elif isinstance(node, ast.NamedExpr):  # walrus :=
             if isinstance(node.target, ast.Name):
                 defined.add(node.target.id)
     return defined
+
+
+def _collect_arg_names(args: ast.arguments, defined: set[str]) -> None:
+    for a in args.args + args.posonlyargs + args.kwonlyargs:
+        if a.arg:
+            defined.add(a.arg)
+    if args.vararg:
+        defined.add(args.vararg.arg)
+    if args.kwarg:
+        defined.add(args.kwarg.arg)
 
 
 def _collect_assign_targets(target: ast.expr, defined: set[str]) -> None:
@@ -1185,6 +1285,12 @@ def scan_file(file_path: str) -> dict:
     # the loaded dependency API knowledge base.
     module = _module_name(p, Path(idx.root)) if idx is not None else p.stem
     imported_symbols = _normalize_imported_symbols(res.imported_symbols or {}, tree, module)
+    if idx is not None:
+        # A monorepo sub-project writes absolute imports meaning its own
+        # package (``from pkg.foo import Thing`` under ``services/web/``);
+        # against the repo-rooted index those names only exist one package
+        # level up. Re-point them so valid imports are not hallucinations.
+        imported_symbols = resolve_package_relative_imports(imported_symbols, idx, module)
     defined |= valid_imported_names(imported_symbols, idx, dep_names, dep_roots)
     # A star import whose source cannot be enumerated may have bound any name;
     # unproven bare calls in this file must then stay silent.
@@ -1476,11 +1582,15 @@ def find_dead_code(
     return {"success": True, "dead_symbols": dead, "count": len(dead)}
 
 
-def find_similar_code(threshold: float = 0.85) -> dict:
+def find_similar_code(threshold: float = 0.85, time_budget: float = 30.0) -> dict:
     """Find function-level code clones across the project.
 
     Uses a length-ratio pre-filter to skip obviously dissimilar pairs before
-    running the more expensive ``SequenceMatcher``.
+    running the more expensive ``SequenceMatcher``. The comparison loop is
+    quadratic in the number of functions, so it runs under a wall-clock budget
+    (*time_budget* seconds): on a corpus large enough to exhaust the budget
+    the pairs found so far are returned with ``truncated: true`` rather than
+    stalling the tool for minutes.
     """
     with _state_lock:
         root = _project_root
@@ -1499,6 +1609,9 @@ def find_similar_code(threshold: float = 0.85) -> dict:
 
     from difflib import SequenceMatcher
 
+    deadline = time.monotonic() + max(1.0, time_budget)
+    truncated = False
+
     # Pre-filter: group by similar length to avoid comparing very short or
     # very different functions.  The similarity ratio between two strings is
     # bounded by min(len(a), len(b)) / max(len(a), len(b)), so we can skip
@@ -1509,6 +1622,9 @@ def find_similar_code(threshold: float = 0.85) -> dict:
         len1 = len(b1)
         if len1 < 30:
             continue
+        if time.monotonic() > deadline:
+            truncated = True
+            break
         for j in range(i + 1, len(functions)):
             p2, n2, b2, r2 = functions[j]
             len2 = len(b2)
@@ -1531,9 +1647,15 @@ def find_similar_code(threshold: float = 0.85) -> dict:
                         "similarity": round(ratio, 3),
                     }
                 )
+            if time.monotonic() > deadline:
+                truncated = True
+                break
 
     pairs.sort(key=lambda x: x["similarity"], reverse=True)
-    return {"success": True, "pairs": pairs, "count": len(pairs)}
+    result = {"success": True, "pairs": pairs, "count": len(pairs)}
+    if truncated:
+        result["truncated"] = True
+    return result
 
 
 def explore_call_graph(symbol_name: str) -> dict:
@@ -1844,9 +1966,11 @@ def search_code(pattern: str, glob: str = "*.py") -> dict:
     for p in candidates if candidates is not None else root.rglob(glob):
         if "__pycache__" in p.parts:
             continue
-        try:
-            text = p.read_text(encoding="utf-8")
-        except Exception:  # noqa: BLE001
+        # read_python_source honours PEP 263 cookies and skips undecodable
+        # files instead of raising; a strict utf-8 read silently dropped every
+        # legally non-UTF-8 file from the search.
+        text = read_python_source(p)
+        if text is None:
             continue
         for m in regex.finditer(text):
             line = text[: m.start()].count("\n") + 1

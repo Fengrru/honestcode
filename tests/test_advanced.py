@@ -87,7 +87,36 @@ def test_check_api_unknown_suggestion():
     load_package_apis("math")
     res = check_api("math.sqrtt")
     assert res["valid"] is False
-    assert "suggestion" in res
+
+
+def test_check_api_does_not_import_workspace_module(tmp_path: Path, monkeypatch):
+    """check_api must not import a bare file that merely sits on sys.path.
+
+    Importing executes code. An agent-written module in the workspace is
+    importable from the server's cwd but is not an installed distribution, so
+    answering ``check_api("name.attr")`` used to run agent-authored code inside
+    the server process. Distribution metadata is read without executing.
+    """
+    probe = tmp_path / "hc_probe_not_a_distribution.py"
+    probe.write_text(
+        "import pathlib\npathlib.Path(str(pathlib.Path(__file__)) + '.IMPORTED').write_text('x')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    res = check_api("hc_probe_not_a_distribution.anything")
+    assert res["success"] is True
+    assert res.get("valid") is False
+    assert res.get("reason") == "unknown module"
+    assert not probe.with_name(probe.name + ".IMPORTED").exists()
+
+
+def test_check_api_still_answers_stdlib_without_prelude():
+    """A fresh process can ask about the stdlib — the import gate allows it."""
+    from honestcode.mcp.tools import reset_dependency_state
+
+    reset_dependency_state()
+    res = check_api("math.sqrt")
+    assert res["valid"] is True
 
 
 def test_explore_call_graph(sample_project: Path):

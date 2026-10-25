@@ -259,3 +259,135 @@ def test_undefined_import_still_detected_without_marker(tmp_path: Path, monkeypa
 
     issues = _scan_in(project, "cases", "from lib.http import NoSuchThing\nNoSuchThing()\n")
     assert any(i["name"] == "NoSuchThing" for i in issues), issues
+
+
+def test_no_false_positive_on_rebound_receiver(tmp_path: Path):
+    """A variable reassigned to another type must silence, not mis-type, its uses.
+
+    The binding walk is not flow-sensitive, so applying the *last* constructor
+    to every use reported the valid ``AClient.push()`` call as an invented
+    ``BClient.push()`` with ``confidence: deterministic``.
+    """
+    (tmp_path / "lib.py").write_text(
+        "class AClient:\n    def push(self):\n        return 1\n\n"
+        "class BClient:\n    def pop(self):\n        return 2\n",
+        encoding="utf-8",
+    )
+    code = (
+        "from lib import AClient, BClient\n\n"
+        "def run():\n"
+        "    client = AClient()\n"
+        "    client.push()\n"
+        "    client = BClient()\n"
+        "    return client\n"
+    )
+    assert _scan(tmp_path, code) == []
+
+
+def test_no_false_positive_on_conditionally_rebound_receiver(tmp_path: Path):
+    """A reassignment hidden behind an ``if`` must silence the receiver too."""
+    (tmp_path / "lib.py").write_text(
+        "class AClient:\n    def push(self):\n        return 1\n\n"
+        "class BClient:\n    def pop(self):\n        return 2\n",
+        encoding="utf-8",
+    )
+    code = (
+        "from lib import AClient, BClient\n\n"
+        "def run(flag):\n"
+        "    client = AClient()\n"
+        "    client.push()\n"
+        "    if flag:\n"
+        "        client = BClient()\n"
+        "    return client\n"
+    )
+    assert _scan(tmp_path, code) == []
+
+
+def test_no_false_positive_on_with_as_bare_call(tmp_path: Path):
+    """``with Runner() as step: step()`` — the with-binding defines ``step``.
+
+    Names bound by ``with ... as`` and lambda parameters were missing from the
+    defined set, so both bare calls were reported as undefined symbols.
+    """
+    code = (
+        "class Runner:\n"
+        "    def __enter__(self):\n        return self.step\n"
+        "    def step(self):\n        return 1\n"
+        "    def __exit__(self, *a):\n        return False\n"
+        "\n"
+        "def drive():\n"
+        "    with Runner() as step:\n"
+        "        step()\n"
+        "    mapper = lambda convert: convert()\n"
+        "    return mapper\n"
+    )
+    assert _scan(tmp_path, code) == []
+
+
+def test_collect_local_defined_covers_binding_forms():
+    """with-as, except-as, lambda params, comprehension targets, globals."""
+    import ast
+
+    from honestcode.mcp.tools import _collect_local_defined
+
+    tree = ast.parse(
+        "with open('f') as fh:\n    pass\n"
+        "try:\n    pass\nexcept ValueError as err:\n    pass\n"
+        "handler = lambda event: event\n"
+        "rows = [r for r in data]\n"
+        "COUNTER = 0\n"
+        "def bump():\n"
+        "    global COUNTER\n"
+        "    COUNTER += 1\n"
+    )
+    defined = _collect_local_defined(tree)
+    assert {"fh", "err", "event", "r", "COUNTER"} <= defined
+
+
+def test_no_false_positive_on_monorepo_subproject_import(tmp_path: Path, monkeypatch):
+    """``from pkg.foo import Thing`` inside a monorepo sub-project is valid.
+
+    Auto-discovery indexes from the repository root (the ``.git`` marker), so
+    the module only exists as ``services.web.pkg.foo``; the verifier must
+    re-point the import at the file's own package instead of reporting the
+    symbol as undefined.
+    """
+    _clear_index_state(monkeypatch)
+    tools_mod.reset_dependency_state()
+    (tmp_path / ".git").mkdir()
+    sub = tmp_path / "services" / "web"
+    (sub / "pkg").mkdir(parents=True)
+    (sub / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "pkg" / "foo.py").write_text(
+        "class Thing:\n    def go(self):\n        return 1\n", encoding="utf-8"
+    )
+    app = sub / "app.py"
+    app.write_text(
+        "from pkg.foo import Thing\n\ndef main():\n    t = Thing()\n    return t.go()\n",
+        encoding="utf-8",
+    )
+    res = scan_file(str(app))
+    assert res["success"], res.get("error")
+    assert res["issues"] == [], res["issues"]
+
+
+def test_invented_method_on_monorepo_import_still_detected(tmp_path: Path, monkeypatch):
+    """The package-relative fallback must not blanket-silence hallucinations."""
+    _clear_index_state(monkeypatch)
+    tools_mod.reset_dependency_state()
+    (tmp_path / ".git").mkdir()
+    sub = tmp_path / "services" / "web"
+    (sub / "pkg").mkdir(parents=True)
+    (sub / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "pkg" / "foo.py").write_text(
+        "class Thing:\n    def go(self):\n        return 1\n", encoding="utf-8"
+    )
+    app = sub / "app.py"
+    app.write_text(
+        "from pkg.foo import Thing\n\ndef main():\n    t = Thing()\n    return t.fly()\n",
+        encoding="utf-8",
+    )
+    res = scan_file(str(app))
+    assert any(i["kind"] == "invented_api" and i["name"] == "fly" for i in res["issues"]), res[
+        "issues"
+    ]

@@ -41,3 +41,7 @@ class ParseResult:
     # Cross-file: symbols imported from / exported to other files
     imported_symbols: dict[str, str] | None = None  # name -> source_module
     exported_symbols: set[str] | None = None  # names defined here, usable by others
+    # class qname -> syntactic base names (dotted, as written). Recorded at
+    # parse time so the symbol index can answer "is any class a subclass of
+    # X" without re-parsing every class-defining file per verification.
+    class_bases: dict[str, list[str]] | None = None

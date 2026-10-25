@@ -37,6 +37,7 @@ from honestcode.structure.utils import (
 from honestcode.verify.evidence import (
     ACTION_INSPECT,
     CONFIDENCE_DETERMINISTIC,
+    CONFIDENCE_HIGH,
     KIND_INVENTED_API,
     KIND_SYNTAX_ERROR,
     KIND_UNDEFINED_SYMBOL,
@@ -53,10 +54,13 @@ from honestcode.verify.surface import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from honestcode.honest.symbol_index import ProjectIndex
 
 __all__ = [
     "SurfaceStore",
+    "resolve_package_relative_imports",
     "star_imports_unresolved",
     "valid_imported_names",
     "verify_file_source",
@@ -110,6 +114,54 @@ def star_imports_unresolved(imported_symbols: dict[str, str], index: ProjectInde
         if _star_names(module, index, frozenset()) is None:
             return True
     return False
+
+
+def _index_knows(index: ProjectIndex, qname: str, project_modules: set[str]) -> bool:
+    """Whether *qname* names (or lives inside) something the index has seen."""
+    if qname in index.symbols or qname in project_modules:
+        return True
+    mod, _, attr = qname.rpartition(".")
+    return bool(mod and attr and attr in index.module_symbols.get(mod, ()))
+
+
+def resolve_package_relative_imports(
+    imported_symbols: dict[str, str],
+    index: ProjectIndex | None,
+    module: str,
+) -> dict[str, str]:
+    """Re-point unresolvable absolute imports at the file's own package.
+
+    A file inside a monorepo sub-project writes ``from pkg.foo import Thing``
+    meaning *its own* ``pkg`` — but the auto-discovered index is rooted at the
+    repository, where that module is ``services.web.pkg.foo.Thing``. The import
+    then fails every project-grounded check and a perfectly valid import was
+    reported as an undefined symbol. When the file's package directory joined
+    in front of the source *does* exist in the index, the import map is
+    rewritten to that absolute name; anything else is left untouched, so a
+    genuine hallucination is never silenced by this fallback.
+    """
+    if index is None or not module or "." not in module:
+        return imported_symbols
+    package_dir = module.rpartition(".")[0]
+
+    project_roots: set[str] = set()
+    project_modules: set[str] = set()
+    for qname in index.symbols:
+        parts = qname.split(".")
+        project_roots.add(parts[0])
+        for i in range(1, len(parts)):
+            project_modules.add(".".join(parts[:i]))
+
+    out = dict(imported_symbols)
+    for local_name, source_name in imported_symbols.items():
+        if not source_name or local_name.startswith("*") or source_name.startswith("."):
+            continue
+        if _index_knows(index, source_name, project_modules):
+            continue
+        candidate = f"{package_dir}.{source_name}"
+        if _index_knows(index, candidate, project_modules):
+            out[local_name] = candidate
+    return out
 
 
 def valid_imported_names(
@@ -420,46 +472,102 @@ class SurfaceStore:
         component. The check is name-based on purpose: resolving every base in
         the project would cost more than the answer is worth, and a short-name
         collision only ever makes the verifier quieter, never louder.
+
+        The base-name table comes from the symbol index (recorded at index
+        time), so this costs one set lookup; the old implementation parsed
+        every class-defining file on first use, which made a cold scan of a
+        few-hundred-file project take seconds. Indexes without the table (an
+        older build) fall back to that scan.
         """
         if self._base_short_names is None:
             names: set[str] = set()
             for surface in self.local_classes.values():
                 names.update(b.rsplit(".", 1)[-1] for b in surface.bases)
             if self.index is not None:
-                for qname_, info in self.index.symbols.items():
-                    if info.kind != "class":
-                        continue
-                    surface = self.class_surface(qname_)
-                    if surface is not None:
-                        names.update(b.rsplit(".", 1)[-1] for b in surface.bases)
+                indexed = getattr(self.index, "class_base_names", None)
+                if indexed is not None:
+                    names.update(indexed)
+                else:
+                    for qname_, info in self.index.symbols.items():
+                        if info.kind != "class":
+                            continue
+                        surface = self.class_surface(qname_)
+                        if surface is not None:
+                            names.update(b.rsplit(".", 1)[-1] for b in surface.bases)
             self._base_short_names = names
         return qname.rsplit(".", 1)[-1] in self._base_short_names
 
 
 # ── Scope tracking ──────────────────────────────────────────────────────
+_BINDING_CARRY: tuple[type[ast.AST], ...] = tuple(
+    t
+    for t in (
+        ast.If,
+        ast.For,
+        ast.AsyncFor,
+        ast.While,
+        ast.With,
+        ast.AsyncWith,
+        ast.Try,
+        getattr(ast, "TryStar", None),
+    )
+    if t is not None
+)
+
+
+def _iter_binding_stmts(node: ast.AST) -> Iterator[ast.stmt]:
+    """Yield assignment statements that bind names in *node*'s scope.
+
+    Control-flow blocks are descended into (an assignment under ``if`` or
+    ``try`` still binds the name in this scope), but nested function and class
+    bodies are not — their assignments live in their own scope. This used to
+    look only at the direct children of *node*, which made bindings hidden
+    behind a branch invisible to the verifier.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(child, (ast.Assign, ast.AnnAssign)):
+            yield child
+        elif isinstance(child, _BINDING_CARRY):
+            yield from _iter_binding_stmts(child)
+
+
 def _bindings_of(node: ast.AST, *, is_function: bool) -> dict[str, str]:
-    """Collect ``variable -> type name`` bindings introduced directly in *node*."""
-    out: dict[str, str] = {}
+    """Collect ``variable -> type name`` bindings introduced in *node*'s scope.
+
+    The walk is not flow-sensitive: it sees the whole scope at once, so a
+    variable assigned from two different constructors is indistinguishable
+    from one whose type changes mid-body. Applying the *last* assignment to
+    every use (the previous behaviour) flagged valid calls as invented APIs —
+    ``client = AClient(); client.push(); client = BClient()`` reported
+    ``BClient.push()`` as missing on a line that runs against ``AClient``.
+    A name bound to more than one distinct type therefore collapses to the
+    empty string, which every consumer treats as "unknown — stay silent".
+    """
+    types_by_name: dict[str, set[str]] = {}
     if is_function:
         for arg in _all_args(node):  # type: ignore[arg-type]
             if arg.annotation is not None:
                 name = annotation_name(arg.annotation)
                 if name:
-                    out[arg.arg] = name
-    for child in ast.iter_child_nodes(node):
-        if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
-            name = annotation_name(child.annotation) if child.annotation else None
-            if name is None and isinstance(child.value, ast.Call):
-                name = call_name(child.value.func)
+                    types_by_name.setdefault(arg.arg, set()).add(name)
+    for stmt in _iter_binding_stmts(node):
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            name = annotation_name(stmt.annotation) if stmt.annotation else None
+            if name is None and isinstance(stmt.value, ast.Call):
+                name = call_name(stmt.value.func)
             if name:
-                out[child.target.id] = name
-        elif isinstance(child, ast.Assign) and isinstance(child.value, ast.Call):
-            name = call_name(child.value.func)
+                types_by_name.setdefault(stmt.target.id, set()).add(name)
+        elif isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            name = call_name(stmt.value.func)
             if name:
-                for target in child.targets:
+                for target in stmt.targets:
                     if isinstance(target, ast.Name):
-                        out[target.id] = name
-    return out
+                        types_by_name.setdefault(target.id, set()).add(name)
+    return {
+        name: next(iter(types)) if len(types) == 1 else "" for name, types in types_by_name.items()
+    }
 
 
 def _all_args(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.arg]:
@@ -692,12 +800,18 @@ class _Verifier:
                 # A star import whose source could not be enumerated may have
                 # bound this name — absence cannot be proven, stay silent.
                 return
+            # "high", not "deterministic": name absence rests on the syntactic
+            # binding model of this file (imports, assignments, index), which
+            # by design has escape hatches (exec, dynamic patching, names the
+            # model never sees). Member-surface claims are the only ones the
+            # verifier can actually prove.
             self._finding(
                 line=call.lineno,
                 kind=KIND_UNDEFINED_SYMBOL,
                 symbol=name,
                 message=f"`{name}` is not defined in this project or in any loaded dependency.",
                 evidence={"kind": "call"},
+                confidence=CONFIDENCE_HIGH,
                 action=ACTION_INSPECT,
             )
             return
@@ -947,6 +1061,8 @@ def verify_file_source(
         imported = StructureExtractor().parse_source(source).imported_symbols or {}
     except Exception:  # noqa: BLE001 - defensive
         imported = {}
+    module = module_name_for(path, root) if root else path.stem
+    imported = resolve_package_relative_imports(imported, index, module)
     return verify_tree(
         tree,
         path=path,
