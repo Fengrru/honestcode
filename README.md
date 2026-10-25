@@ -114,15 +114,15 @@ missed finding for a false one.
 
 ## Install
 
-One line — no clone, no virtualenv (once the package is on PyPI):
+One line — no clone, no virtualenv:
 
 ```bash
 claude mcp add honestcode -- uvx honestcode-mcp
 ```
 
 `uvx` fetches the server into an isolated environment on first use; install
-[`uv`](https://docs.astral.sh/uv/) first if you do not have it. Until the
-first PyPI release is published, install from a checkout:
+[`uv`](https://docs.astral.sh/uv/) first if you do not have it. From a checkout
+(to hack on the code, or if you prefer not to use `uv`):
 
 ```bash
 git clone https://github.com/Fengrru/honestcode
