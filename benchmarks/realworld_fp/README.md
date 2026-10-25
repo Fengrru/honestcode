@@ -24,10 +24,29 @@ python benchmarks/realworld_fp/run.py --format json
 python benchmarks/realworld_fp/run.py --project /path/to/another/project
 ```
 
-Exit code is `0` when the corpus is clean and `2` when any finding is reported,
-a file could not be verified, or no Python files were found (a broken
-`--project` must not look like a pass). A finding on this corpus is, by
-construction, a false positive.
+By default the run covers the vendored snapshot **and** every scenario under
+`regressions/`; an explicit `--project` scans just that directory. Exit code is
+`0` when the corpus is clean and `2` when any finding is reported, a file could
+not be verified, or no Python files were found (a broken `--project` must not
+look like a pass). A finding on this corpus is, by construction, a false
+positive.
+
+## Regression scenarios
+
+`regressions/` holds one tiny project per false-positive class found in the
+wild. Each is scanned as its own project root so the scenario exercises the
+same root-discovery path a real session would:
+
+- `rebound_receiver/` — a variable reassigned to another type mid-body; the
+  verifier must refuse to judge its uses instead of applying the last
+  constructor to every call
+- `with_as_binding/` — names bound by `with ... as` and lambda parameters used
+  as bare calls
+- `local_bindings/` — `except ... as` names, lambda parameters, comprehension
+  targets and `global` declarations counting as defined names
+- `monorepo_subproject/` — absolute imports inside a sub-project of a
+  repository root; the verifier re-points them at the file's own package
+  instead of reporting the symbol as undefined
 
 ## The vendored project
 

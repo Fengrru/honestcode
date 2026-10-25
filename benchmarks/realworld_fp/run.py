@@ -36,6 +36,16 @@ from honestcode.mcp.tools import (  # noqa: E402
 )
 
 VENDOR = Path(__file__).parent / "vendor"
+# Small deterministic projects, one per false-positive class found in the
+# wild. Real code exercises these only by accident; each corpus directory
+# pins one scenario so a regression fails CI with a named cause.
+REGRESSIONS = Path(__file__).parent / "regressions"
+
+
+def _regression_projects() -> list[Path]:
+    if not REGRESSIONS.is_dir():
+        return []
+    return sorted(p for p in REGRESSIONS.iterdir() if p.is_dir())
 
 
 def run(project: Path) -> dict:
@@ -98,7 +108,25 @@ def main() -> int:
         print(f"Project not found: {project}", file=sys.stderr)
         return 1
 
-    result = run(project)
+    # The vendored snapshot plus (by default) every regression scenario; an
+    # explicit --project scans just that directory.
+    projects = (
+        [project]
+        if Path(args.project).resolve() != VENDOR.resolve()
+        else ([project, *_regression_projects()])
+    )
+    results = [run(p) for p in projects]
+    result = {
+        "project": ", ".join(r["project"] for r in results),
+        "files": sum(r["files"] for r in results),
+        "findings": [f for r in results for f in r["findings"]],
+        "errors": [e for r in results for e in r["errors"]],
+        "count": sum(r["count"] for r in results),
+        "elapsed_seconds": round(sum(r["elapsed_seconds"] for r in results), 2),
+        "ms_per_file": 0.0,
+    }
+    if result["files"]:
+        result["ms_per_file"] = round(result["elapsed_seconds"] / result["files"] * 1000, 1)
 
     if args.format == "json":
         print(json.dumps(result, indent=2))
