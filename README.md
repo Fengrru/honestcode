@@ -618,3 +618,5 @@ no background services, and no phone-home endpoints.
 ## License
 
 [MIT](LICENSE) - Copyright (c) 2026 HonestCode Team
+
+MCP Registry: mcp-name: io.github.Fengrru/honestcode
