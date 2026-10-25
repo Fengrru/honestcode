@@ -7,6 +7,13 @@ updates:
     labels:
       - dependencies
     open-pull-requests-limit: 10
+    ignore:
+      # mcp 2.x removed `mcp.server.fastmcp`, which this server imports;
+      # pyproject.toml pins mcp <2.0 on purpose. Bumping it is a code change
+      # (migrate to the new server API), not a dependency bump.
+      - dependency-name: mcp
+        update-types:
+          - version-update:semver-major
 
   - package-ecosystem: github-actions
     directory: /
