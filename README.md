@@ -241,6 +241,36 @@ message:
 
 The loop is deterministic and auditable.
 
+### Scope and limitations
+
+The verifier stays silent wherever it cannot *prove* absence — that is the
+feature, but it means detection has known boundaries:
+
+* **Decorated classes are not judged for invented members.** Any class
+  decorator (including `@dataclass`) may add or rewrite members, so invented
+  method calls on such classes are not reported. Undecorated classes are fully
+  checked.
+* **Standard-library member calls are not checked.** `from typing import
+  TypeVarr` (an invented *import*) is caught, but `os.path.joinn()` (an
+  invented *call* on a real module) is not — third-party and project members
+  are the covered surface.
+* **Factory-function receivers are not judged.** `make_client().refresh()` is
+  skipped; annotations, constructor assignments, `self`/`cls`, and inline
+  constructors (`UserClient().refresh()`) are resolved.
+* **`undefined_symbol` carries `confidence: high`, not `deterministic`.**
+  Only member-surface claims (invented APIs on a fully enumerated class) are
+  provable from the repository; name absence rests on the syntactic binding
+  model and keeps the lower confidence. Variables reassigned across types in
+  one scope are treated as unknown and never judged.
+* **Graph tools are anchored to the last indexed project.** `scan_file` /
+  `verify_file` resolve the project root per file (including monorepo
+  sub-projects); `find_dead_code`, `explore_call_graph`, `search_code` and
+  friends operate on the project most recently passed to `index_project`.
+* **`check_api` imports the base package on demand** — but only when it is
+  genuinely installed (or stdlib). A bare file dropped into the workspace is
+  never imported, so agent-authored code cannot be executed server-side
+  through this tool.
+
 ---
 
 ## MCP tools
@@ -369,9 +399,14 @@ constructs synthetic tasks never do — stdlib imports, keyword-call style,
 modules — and any finding on this corpus is, by construction, a false
 positive.
 
+The same run also scans `benchmarks/realworld_fp/regressions/`: one tiny
+project per false-positive class found in the wild (a receiver rebound across
+types, `with ... as` bindings, monorepo sub-project imports, local binding
+forms). Each scenario fails the benchmark by name if the regression returns.
+
 ```bash
 python benchmarks/realworld_fp/run.py
-# files: 19  findings: 0  elapsed: 0.4s (~20 ms/file)
+# files: 25  findings: 0  elapsed: 0.7s (~26 ms/file)
 ```
 
 The finding count is the claim; the elapsed time is indicative, and varies with
